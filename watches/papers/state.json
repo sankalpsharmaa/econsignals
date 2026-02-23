@@ -52,5 +52,17 @@
       "environmental_econ": "2026-02-23",
       "political_economy": "2026-02-23"
     }
+  },
+  "imf": {
+    "last_fetched": "2026-02-23"
+  },
+  "iza": {
+    "last_fetched": "2026-02-23"
+  },
+  "bread": {
+    "last_fetched": "2026-02-23"
+  },
+  "repec_nep": {
+    "last_fetched": "2026-02-23"
   }
 }
