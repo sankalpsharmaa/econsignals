@@ -1,1 +1,10 @@
-{"last_scan": null, "sensors": {}}
+{
+  "last_scan": null,
+  "sensors": {},
+  "igc": {
+    "last_fetched": "2026-02-23"
+  },
+  "rbi": {
+    "last_fetched": "2026-02-23"
+  }
+}
