@@ -1,0 +1,18 @@
+{
+  "last_scan": null,
+  "sensors": {
+    "openalex": {
+      "last_fetched": null,
+      "last_page_token": null
+    },
+    "rss_feeds": {
+      "last_fetched": {}
+    }
+  },
+  "openalex_last_fetched": "2026-02-23",
+  "rss_last_fetch": {
+    "mostly_economics": "2026-02-23",
+    "marginal_revolution": "2026-02-23",
+    "chris_blattman": "2026-02-23"
+  }
+}
