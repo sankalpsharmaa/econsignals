@@ -396,107 +396,110 @@ def generate_daily_brief(days: int = 1, limit: int = 20) -> str:
     today = date.today().isoformat()
     db = get_db()
 
-    fetch_limit = max(limit * 8, 200)
-    papers = get_recent_papers(days=days, limit=fetch_limit)
+    try:
+        fetch_limit = max(limit * 8, 200)
+        papers = get_recent_papers(days=days, limit=fetch_limit)
 
-    # If the strict daily window is too sparse after filtering, broaden scope.
-    effective_days = days
-    if len(papers) < 50 and days < 7:
-        papers = get_recent_papers(days=7, limit=fetch_limit)
-        effective_days = 7
+        # If the strict daily window is too sparse after filtering, broaden scope.
+        effective_days = days
+        if len(papers) < 50 and days < 7:
+            papers = get_recent_papers(days=7, limit=fetch_limit)
+            effective_days = 7
 
-    source_map = _get_source_map(db, [p["id"] for p in papers])
-    curated_all = _curate_econ_papers(papers, source_map)
+        source_map = _get_source_map(db, [p["id"] for p in papers])
+        curated_all = _curate_econ_papers(papers, source_map)
 
-    journal_items = _sort_brief_rank(
-        [p for p in curated_all if (p.get("paper_type") or "") == "journal_article"]
-    )
-    wp_policy_items = _sort_brief_rank(
-        [p for p in curated_all if (p.get("paper_type") or "") != "journal_article"]
-    )
-    priority_reads = _build_priority_reads(journal_items, wp_policy_items, limit=10)
-    priority_ids = {p["id"] for p in priority_reads}
-    curated = priority_reads + [
-        p for p in curated_all if p["id"] not in priority_ids
-    ]
-    curated = curated[: max(limit, 30)]
+        journal_items = _sort_brief_rank(
+            [p for p in curated_all if (p.get("paper_type") or "") == "journal_article"]
+        )
+        wp_policy_items = _sort_brief_rank(
+            [p for p in curated_all if (p.get("paper_type") or "") != "journal_article"]
+        )
+        priority_reads = _build_priority_reads(journal_items, wp_policy_items, limit=10)
+        priority_ids = {p["id"] for p in priority_reads}
+        curated = priority_reads + [
+            p for p in curated_all if p["id"] not in priority_ids
+        ]
+        curated = curated[: max(limit, 30)]
 
-    deadlines = get_upcoming_deadlines(days=30)
+        deadlines = get_upcoming_deadlines(days=30)
 
-    lines: list[str] = []
-    lines.append(f"# EconSignals Daily Brief - {today}")
-    lines.append("")
-    lines.append(
-        f"*Curated economics items from the last {effective_days} day(s). "
-        f"Filtered to remove repository noise and non-econ drift.*"
-    )
-    lines.append("")
-
-    lines.append("## Snapshot")
-    lines.append("")
-    lines.append("| Metric | Value |")
-    lines.append("|-|-|")
-    lines.append(f"| Scanned candidates | {len(papers)} |")
-    lines.append(f"| Curated economics items | {len(curated_all)} |")
-    lines.append(f"| Items shown | {len(curated)} |")
-    lines.append(f"| Journal articles | {len(journal_items)} |")
-    lines.append(f"| Working papers/reports | {len(wp_policy_items)} |")
-    lines.append("")
-
-    lines.append("## Priority Reads")
-    lines.append("")
-    if priority_reads:
-        for idx, paper in enumerate(priority_reads, 1):
-            lines.extend(_render_priority_item(idx, paper, source_map.get(paper["id"], [])))
-    else:
-        lines.append("No high-confidence economics items matched the filter.")
+        lines: list[str] = []
+        lines.append(f"# EconSignals Daily Brief - {today}")
+        lines.append("")
+        lines.append(
+            f"*Curated economics items from the last {effective_days} day(s). "
+            f"Filtered to remove repository noise and non-econ drift.*"
+        )
         lines.append("")
 
-    lines.extend(_render_track_table("Journal Track", journal_items, source_map, limit=8))
-    lines.extend(_render_track_table("Working Paper and Policy Track", wp_policy_items, source_map, limit=8))
-
-    mix = _source_mix(curated, source_map)
-    if mix:
-        lines.append("## Source Mix")
+        lines.append("## Snapshot")
         lines.append("")
-        lines.append("| Source | Count |")
+        lines.append("| Metric | Value |")
         lines.append("|-|-|")
-        for source, count in mix[:10]:
-            lines.append(f"| {source} | {count} |")
+        lines.append(f"| Scanned candidates | {len(papers)} |")
+        lines.append(f"| Curated economics items | {len(curated_all)} |")
+        lines.append(f"| Items shown | {len(curated)} |")
+        lines.append(f"| Journal articles | {len(journal_items)} |")
+        lines.append(f"| Working papers/reports | {len(wp_policy_items)} |")
         lines.append("")
 
-    if deadlines:
-        lines.append("## Upcoming Deadlines")
+        lines.append("## Priority Reads")
         lines.append("")
-        lines.append("| Date | Type | Name | Organization |")
-        lines.append("|-|-|-|-|")
-        for d in deadlines[:10]:
-            org = d.get("organization") or ""
-            lines.append(f"| {d['deadline_date']} | {d['type']} | {d['name']} | {org} |")
-        lines.append("")
+        if priority_reads:
+            for idx, paper in enumerate(priority_reads, 1):
+                lines.extend(_render_priority_item(idx, paper, source_map.get(paper["id"], [])))
+        else:
+            lines.append("No high-confidence economics items matched the filter.")
+            lines.append("")
 
-    runs = db.execute(
-        "SELECT sensor, status, finished_at, items_found, items_new FROM sensor_runs ORDER BY finished_at DESC LIMIT 50"
-    ).fetchall()
+        lines.extend(_render_track_table("Journal Track", journal_items, source_map, limit=8))
+        lines.extend(_render_track_table("Working Paper and Policy Track", wp_policy_items, source_map, limit=8))
 
-    if runs:
-        lines.append("## Sensor Health")
-        lines.append("")
-        lines.append("| Sensor | Status | Last Run | Found | New |")
-        lines.append("|-|-|-|-|-|")
-        seen: set[str] = set()
-        for sensor, status, finished_at, items_found, items_new in runs:
-            if sensor in seen:
-                continue
-            seen.add(sensor)
-            lines.append(
-                f"| {sensor} | {status} | {finished_at or 'never'} | {items_found} | {items_new} |"
-            )
-            if len(seen) >= 12:
-                break
-        lines.append("")
+        mix = _source_mix(curated, source_map)
+        if mix:
+            lines.append("## Source Mix")
+            lines.append("")
+            lines.append("| Source | Count |")
+            lines.append("|-|-|")
+            for source, count in mix[:10]:
+                lines.append(f"| {source} | {count} |")
+            lines.append("")
 
-    return "\n".join(lines)
+        if deadlines:
+            lines.append("## Upcoming Deadlines")
+            lines.append("")
+            lines.append("| Date | Type | Name | Organization |")
+            lines.append("|-|-|-|-|")
+            for d in deadlines[:10]:
+                org = d.get("organization") or ""
+                lines.append(f"| {d['deadline_date']} | {d['type']} | {d['name']} | {org} |")
+            lines.append("")
+
+        runs = db.execute(
+            "SELECT sensor, status, finished_at, items_found, items_new FROM sensor_runs ORDER BY finished_at DESC LIMIT 50"
+        ).fetchall()
+
+        if runs:
+            lines.append("## Sensor Health")
+            lines.append("")
+            lines.append("| Sensor | Status | Last Run | Found | New |")
+            lines.append("|-|-|-|-|-|")
+            seen: set[str] = set()
+            for sensor, status, finished_at, items_found, items_new in runs:
+                if sensor in seen:
+                    continue
+                seen.add(sensor)
+                lines.append(
+                    f"| {sensor} | {status} | {finished_at or 'never'} | {items_found} | {items_new} |"
+                )
+                if len(seen) >= 12:
+                    break
+            lines.append("")
+
+        return "\n".join(lines)
+    finally:
+        db.close()
 
 
 def write_brief(days: int = 1) -> Path:
