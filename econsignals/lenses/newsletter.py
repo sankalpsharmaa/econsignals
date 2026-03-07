@@ -495,13 +495,33 @@ def generate_plain(
 # ---------------------------------------------------------------------------
 
 
+def _resend_sender() -> str | None:
+    sender = (os.environ.get("RESEND_FROM") or "").strip()
+    if sender:
+        return sender
+
+    sender_email = (os.environ.get("RESEND_FROM_EMAIL") or "").strip()
+    if not sender_email:
+        return None
+
+    sender_name = (os.environ.get("RESEND_FROM_NAME") or "").strip() or "EconSignals"
+    return f"{sender_name} <{sender_email}>"
+
+
 def _send_resend(html: str, plain: str, to: str) -> bool:
     api_key = (os.environ.get("RESEND_API_KEY") or "").strip()
     if not api_key:
         return False
+    sender = _resend_sender()
+    if not sender:
+        print(
+            "[newsletter] Resend sender not configured; set RESEND_FROM or RESEND_FROM_EMAIL",
+            file=sys.stderr,
+        )
+        return False
 
     payload = {
-        "from": "EconSignals <onboarding@resend.dev>",
+        "from": sender,
         "to": [to],
         "subject": f"EconSignals Daily — {date.today().isoformat()}",
         "html": html,
