@@ -41,11 +41,11 @@ _THRESHOLD_TO_SECTION: dict[int, int] = {
 
 
 def _applicable_threshold(days_until: int) -> int | None:
-    """Return the highest threshold that is <= days_until, or None.
+    """Return the smallest threshold that is >= days_until, or None.
 
-    For a deadline 28 days away, the applicable threshold is 30 (the highest
-    threshold that has already been crossed, i.e., <= days_until). We want the
-    most specific one that fires: the highest threshold that is still <= days_until.
+    For a deadline 28 days away, the applicable threshold is 30 (the deadline
+    has entered the 30-day alert window).  We want the tightest window that
+    the deadline currently falls within.
 
     Examples:
         days_until=60 -> 60
@@ -55,8 +55,8 @@ def _applicable_threshold(days_until: int) -> int | None:
     """
     best: int | None = None
     for t in ALERT_THRESHOLDS:
-        if t <= days_until:
-            if best is None or t > best:
+        if t >= days_until:
+            if best is None or t < best:
                 best = t
     return best
 
