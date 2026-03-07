@@ -158,6 +158,31 @@ def _fetch_candidates_by_author_lastname(last_name: str) -> list[dict[str, Any]]
     return results
 
 
+def _fetch_author_names_for_paper(paper_id: int) -> list[str]:
+    """Fetch author display names for a paper from the authors table.
+
+    Args:
+        paper_id: Primary key of the paper.
+
+    Returns:
+        List of author name strings, ordered by position.
+    """
+    conn: sqlite3.Connection = get_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT a.name
+          FROM authors a
+          JOIN paper_authors pa ON pa.author_id = a.id
+         WHERE pa.paper_id = ?
+         ORDER BY pa.position
+        """,
+        (paper_id,),
+    ).fetchall()
+    conn.close()
+    return [row["name"] for row in rows if row["name"]]
+
+
 def _parse_authors_field(row: dict[str, Any]) -> list[str]:
     """Normalize the authors field from a paper row into a list of name strings.
 
@@ -298,7 +323,8 @@ def find_existing_paper(
                 title_score = jaccard_similarity(tokens, title_token_set(row.get("title", "")))
                 if title_score < _JACCARD_AUTHOR_THRESHOLD:
                     continue
-                if author_lastnames_overlap(authors, _parse_authors_field(row)) >= _AUTHOR_OVERLAP_MIN:
+                existing_authors = _fetch_author_names_for_paper(row["id"])
+                if author_lastnames_overlap(authors, existing_authors) >= _AUTHOR_OVERLAP_MIN:
                     return row["id"]
 
     return None

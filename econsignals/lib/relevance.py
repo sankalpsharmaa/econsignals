@@ -299,12 +299,17 @@ def score_author_proximity(paper_id: int, db: sqlite3.Connection) -> float:
     if has_unknown and best < 0.5:
         coauthor_count = db.execute(
             """
-            SELECT COUNT(DISTINCT pa2.author_id)
-            FROM paper_authors pa1
-            JOIN paper_authors pa2 ON pa2.paper_id = pa1.paper_id
-            JOIN authors a2 ON a2.id = pa2.author_id
-            WHERE pa1.paper_id = ?
-              AND a2.is_tracked = 1
+            SELECT COUNT(DISTINCT a_tracked.id)
+            FROM paper_authors pa_this
+            JOIN paper_authors pa_other
+                ON pa_other.author_id = pa_this.author_id
+                AND pa_other.paper_id != pa_this.paper_id
+            JOIN paper_authors pa_coauthor
+                ON pa_coauthor.paper_id = pa_other.paper_id
+            JOIN authors a_tracked
+                ON a_tracked.id = pa_coauthor.author_id
+                AND a_tracked.is_tracked = 1
+            WHERE pa_this.paper_id = ?
             """,
             (paper_id,),
         ).fetchone()[0]
