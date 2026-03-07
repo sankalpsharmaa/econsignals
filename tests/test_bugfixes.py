@@ -6,15 +6,11 @@ Bug 3: Dedup author-overlap fallback never matched (no authors column in papers)
 Bug 4: generate_daily_brief leaked DB connection.
 """
 
-import json
-import sqlite3
-
 import pytest
 
 from econsignals.lib.db import (
     get_db,
     insert_paper,
-    insert_paper_source,
     link_paper_author,
     upsert_author,
 )
@@ -97,8 +93,6 @@ class TestScoreAuthorProximityCoauthor:
         author should score 0.5 on the current paper."""
         from econsignals.lib.relevance import score_author_proximity
 
-        conn = get_db()
-
         # Create a tracked author
         tracked_id = upsert_author("Tracked Author", "tracked author", is_tracked=1)
 
@@ -123,8 +117,10 @@ class TestScoreAuthorProximityCoauthor:
         link_paper_author(pid_b, unknown_id, 0)
 
         db = get_db()
-        score = score_author_proximity(pid_b, db)
-        db.close()
+        try:
+            score = score_author_proximity(pid_b, db)
+        finally:
+            db.close()
 
         # The unknown author on paper B has co-authored paper A with a tracked
         # author, so paper B should get the co-author-of-tracked score (0.5)
@@ -145,8 +141,10 @@ class TestScoreAuthorProximityCoauthor:
         link_paper_author(pid, unknown_id, 0)
 
         db = get_db()
-        score = score_author_proximity(pid, db)
-        db.close()
+        try:
+            score = score_author_proximity(pid, db)
+        finally:
+            db.close()
 
         assert score == 0.0
 
@@ -164,8 +162,10 @@ class TestScoreAuthorProximityCoauthor:
         link_paper_author(pid, tracked_id, 0)
 
         db = get_db()
-        score = score_author_proximity(pid, db)
-        db.close()
+        try:
+            score = score_author_proximity(pid, db)
+        finally:
+            db.close()
 
         assert score == 1.0
 

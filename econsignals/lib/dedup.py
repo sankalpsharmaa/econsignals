@@ -169,18 +169,20 @@ def _fetch_author_names_for_paper(paper_id: int) -> list[str]:
     """
     conn: sqlite3.Connection = get_db()
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT a.name
-          FROM authors a
-          JOIN paper_authors pa ON pa.author_id = a.id
-         WHERE pa.paper_id = ?
-         ORDER BY pa.position
-        """,
-        (paper_id,),
-    ).fetchall()
-    conn.close()
-    return [row["name"] for row in rows if row["name"]]
+    try:
+        rows = conn.execute(
+            """
+            SELECT a.name
+              FROM authors a
+              JOIN paper_authors pa ON pa.author_id = a.id
+             WHERE pa.paper_id = ?
+             ORDER BY pa.position
+            """,
+            (paper_id,),
+        ).fetchall()
+        return [row["name"] for row in rows if row["name"]]
+    finally:
+        conn.close()
 
 
 def _parse_authors_field(row: dict[str, Any]) -> list[str]:
