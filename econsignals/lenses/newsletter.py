@@ -37,6 +37,7 @@ from econsignals.lib.db import (
     update_paper_relevance,
     init_db,
 )
+from econsignals.lib.paths import get_project_root
 from econsignals.lib.zotero_embeddings import compute_zotero_embedding_scores
 from econsignals.lib.zotero_profile import (
     load_zotero_profile,
@@ -60,7 +61,7 @@ except (ImportError, Exception):
     except Exception:
         pass
 
-PROJ_ROOT = Path(__file__).resolve().parents[2]
+PROJ_ROOT = get_project_root()
 
 # ---------------------------------------------------------------------------
 # Load .env if present (no dependencies needed)

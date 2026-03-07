@@ -15,15 +15,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from econsignals.lib.paths import get_project_root
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-# File lives at:  <proj_root>/econsignals/lib/db.py
-# parents[0] = lib
-# parents[1] = econsignals
-# parents[2] = project root
-PROJ_ROOT: Path = Path(__file__).resolve().parents[2]
+PROJ_ROOT: Path = get_project_root()
 
 DB_PATH: Path = Path(
     os.environ.get("ECONSIGNALS_DB", str(PROJ_ROOT / "data" / "econsignals.db"))

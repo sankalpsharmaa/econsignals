@@ -6,8 +6,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from econsignals.lib.db import get_db, get_recent_papers, get_upcoming_deadlines, init_db
+from econsignals.lib.paths import get_project_root
 
-PROJ_ROOT = Path(__file__).resolve().parents[2]
+PROJ_ROOT = get_project_root()
 
 
 _TRUSTED_WORKING_PAPER_SOURCES = {
