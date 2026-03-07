@@ -504,7 +504,7 @@ def _resend_sender() -> str | None:
     if not sender_email:
         return None
 
-    sender_name = (os.environ.get("RESEND_FROM_NAME") or "EconSignals").strip() or "EconSignals"
+    sender_name = (os.environ.get("RESEND_FROM_NAME") or "").strip() or "EconSignals"
     return f"{sender_name} <{sender_email}>"
 
 
