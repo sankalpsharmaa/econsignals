@@ -14,13 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from econsignals.lib.paths import get_project_root
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-# File lives at: <proj_root>/econsignals/lib/relevance.py
-# parents[0] = lib, parents[1] = econsignals, parents[2] = project root
-PROJ_ROOT: Path = Path(__file__).resolve().parents[2]
+PROJ_ROOT: Path = get_project_root()
 
 _JEL_WEIGHTS_PATH: Path = PROJ_ROOT / "profile" / "jel_weights.json"
 _IDENTITY_PATH: Path = PROJ_ROOT / "profile" / "identity.md"

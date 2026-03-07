@@ -12,8 +12,9 @@ from datetime import date
 from pathlib import Path
 
 from econsignals.lib.db import get_db, get_upcoming_deadlines, init_db
+from econsignals.lib.paths import get_project_root
 
-PROJ_ROOT = Path(__file__).resolve().parents[2]
+PROJ_ROOT = get_project_root()
 
 ALERT_THRESHOLDS = [60, 30, 14, 7, 3, 1]
 URGENCY_LABELS = {60: "Notice", 30: "Reminder", 14: "Approaching", 7: "URGENT", 3: "CRITICAL", 1: "FINAL"}

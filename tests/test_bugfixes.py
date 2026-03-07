@@ -1,10 +1,13 @@
-"""Tests for the four bug fixes identified in the repository.
+"""Tests for the bug fixes identified in the repository.
 
 Bug 1: _applicable_threshold used wrong comparison direction.
 Bug 2: score_author_proximity co-author query checked same paper.
 Bug 3: Dedup author-overlap fallback never matched (no authors column in papers).
 Bug 4: generate_daily_brief leaked DB connection.
+Bug 5: cloud deployments need an overridable project root.
 """
+
+import importlib
 
 import pytest
 
@@ -147,6 +150,44 @@ class TestScoreAuthorProximityCoauthor:
             db.close()
 
         assert score == 0.0
+
+
+class TestCloudProjectRoot:
+    def test_db_respects_econsignals_root(self, monkeypatch, tmp_path):
+        from econsignals.lib import db as db_module
+        from econsignals.lib import relevance as relevance_module
+
+        root = tmp_path / "cloud-root"
+        db_path = root / "data" / "cloud.db"
+
+        with monkeypatch.context() as patch:
+            patch.setenv("ECONSIGNALS_ROOT", str(root))
+            patch.setenv("ECONSIGNALS_DB", str(db_path))
+
+            reloaded = importlib.reload(db_module)
+            reloaded_relevance = importlib.reload(relevance_module)
+
+            assert reloaded.PROJ_ROOT == root.resolve()
+            assert reloaded.DB_PATH == db_path.resolve()
+            assert reloaded_relevance.PROJ_ROOT == root.resolve()
+            assert reloaded_relevance._JEL_WEIGHTS_PATH == root.resolve() / "profile" / "jel_weights.json"
+
+        importlib.reload(db_module)
+        importlib.reload(relevance_module)
+
+    def test_deadline_alert_uses_cloud_root_for_reports(self, monkeypatch, tmp_path):
+        from econsignals.lenses import deadline_alert as deadline_alert_module
+
+        root = tmp_path / "cloud-root"
+
+        with monkeypatch.context() as patch:
+            patch.setenv("ECONSIGNALS_ROOT", str(root))
+
+            reloaded = importlib.reload(deadline_alert_module)
+
+            assert reloaded.PROJ_ROOT == root.resolve()
+
+        importlib.reload(deadline_alert_module)
 
     def test_tracked_author_scores_one(self):
         """A paper with a tracked author directly should score 1.0."""
