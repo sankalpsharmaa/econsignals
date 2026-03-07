@@ -4,7 +4,7 @@ EconSignals is a Python research-intelligence pipeline. Sensors collect papers, 
 
 ## Where to work
 
-- Runtime code lives in `/home/runner/work/econsignals/econsignals/econsignals/`.
+- Runtime code lives in `econsignals/`.
 - Sensor entry points are `python -m econsignals.sensors.<name>`.
 - Report generation entry points are `python -m econsignals.lenses.newsletter` and `python -m econsignals.lenses.deadline_alert`.
 - Database access belongs in `econsignals/lib/db.py`; sensors should not write raw SQL directly.

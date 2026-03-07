@@ -61,6 +61,17 @@ def test_send_gmail_uses_configured_sender(monkeypatch):
     assert client.message["To"] == "dest@example.com"
 
 
+def test_send_gmail_skips_without_sender(monkeypatch, capsys):
+    monkeypatch.setenv("GMAIL_APP_PASSWORD", "app-pass")
+    monkeypatch.delenv("GMAIL_EMAIL", raising=False)
+    monkeypatch.delenv("ECONSIGNALS_EMAIL_FROM", raising=False)
+
+    sent = newsletter._send_gmail("<p>Hello</p>", "Hello", "dest@example.com")
+
+    assert sent is False
+    assert "skipping Gmail SMTP" in capsys.readouterr().err
+
+
 def test_send_resend_uses_configured_sender(monkeypatch):
     captured = {}
 

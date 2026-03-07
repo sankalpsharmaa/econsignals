@@ -558,8 +558,14 @@ def _send_gmail(html: str, plain: str, to: str) -> bool:
     sender = (
         os.environ.get("GMAIL_EMAIL")
         or os.environ.get("ECONSIGNALS_EMAIL_FROM")
-        or to
+        or ""
     ).strip()
+    if not sender:
+        print(
+            "[newsletter] GMAIL_EMAIL or ECONSIGNALS_EMAIL_FROM not set — skipping Gmail SMTP",
+            file=sys.stderr,
+        )
+        return False
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"EconSignals Daily — {date.today().isoformat()}"
