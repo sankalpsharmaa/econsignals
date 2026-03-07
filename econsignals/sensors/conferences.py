@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 import sys
-import warnings
 from datetime import date, datetime
 from html import unescape
 from typing import Optional
@@ -39,7 +38,7 @@ CONFERENCES: dict[str, dict] = {
     },
     "pacdev": {
         "name": "Pacific Conference for Development Economics",
-        "url": "https://pacdev.org",
+        "url": "https://pacdev.ucdavis.edu/",
         "org": "PacDev",
         "typical_deadline_month": 11,
         "typical_event_month": 3,
@@ -47,7 +46,7 @@ CONFERENCES: dict[str, dict] = {
     },
     "bread": {
         "name": "Bureau for Research and Economic Analysis of Development",
-        "url": "https://ibread.org/bread/conferences",
+        "url": "https://www.ibread.org/conferences",
         "org": "BREAD",
         "typical_deadline_month": None,
         "typical_event_month": None,
@@ -83,14 +82,6 @@ CONFERENCES: dict[str, dict] = {
         "org": "NBER",
         "typical_deadline_month": 2,
         "typical_event_month": 7,
-        "relevance": 0.9,
-    },
-    "isa_south_asia": {
-        "name": "Indian School of Business Research Conference",
-        "url": "https://www.isb.edu/research",
-        "org": "ISB",
-        "typical_deadline_month": None,
-        "typical_event_month": None,
         "relevance": 0.9,
     },
 }
@@ -371,22 +362,22 @@ class ConferencesSensor(BaseSensor):
     # Per-conference fetch + parse
     # ------------------------------------------------------------------
 
-    def _fetch_text_and_html(self, url: str) -> tuple[str, str]:
+    def _fetch_text_and_html(self, url: str) -> tuple[Optional[str], Optional[str]]:
         """Fetch a URL and return (plain_text, raw_html).
 
         Args:
             url: URL to retrieve.
 
         Returns:
-            Tuple of (plain_text, raw_html). Both are empty strings on error.
+            Tuple of (plain_text, raw_html). Both are None on fetch error.
         """
         try:
             raw = self.fetch_url(url, timeout=30)
             html = raw.decode("utf-8", errors="replace")
             return _strip_html(html), html
         except Exception as exc:
-            warnings.warn(f"[conferences] failed to fetch {url!r}: {exc}")
-            return "", ""
+            print(f"[conferences] failed to fetch {url!r}: {exc}", file=sys.stderr)
+            return None, None
 
     def _parse_conference(self, key: str, conf: dict) -> Optional[dict]:
         """Fetch and parse a single conference page.
@@ -410,6 +401,9 @@ class ConferencesSensor(BaseSensor):
         """
         base_url: str = conf["url"]
         text, html = self._fetch_text_and_html(base_url)
+        if text is None or html is None:
+            self.stats["errors"] = int(self.stats["errors"]) + 1
+            return None
 
         cfp_url: Optional[str] = None
 
@@ -418,7 +412,9 @@ class ConferencesSensor(BaseSensor):
             cfp_url = _find_cfp_url(html, base_url)
             if cfp_url and cfp_url != base_url:
                 cfp_text, cfp_html = self._fetch_text_and_html(cfp_url)
-                if cfp_text:
+                if cfp_text is None or cfp_html is None:
+                    self.stats["errors"] = int(self.stats["errors"]) + 1
+                elif cfp_text:
                     # Prefer the sub-page content for date extraction
                     text = cfp_text
 
@@ -537,7 +533,8 @@ class ConferencesSensor(BaseSensor):
                         file=sys.stderr,
                     )
 
-            log_sensor_end(run_id, "success", self.stats["found"], self.stats["new"])
+            run_status = "partial_success" if int(self.stats["errors"]) > 0 else "success"
+            log_sensor_end(run_id, run_status, self.stats["found"], self.stats["new"])
         except Exception as exc:
             log_sensor_end(run_id, "error", 0, 0, str(exc))
             self.stats["error_message"] = str(exc)
@@ -546,7 +543,11 @@ class ConferencesSensor(BaseSensor):
         result = {
             "sensor": self.name,
             "watch": self.watch,
-            "status": "error" if "error_message" in self.stats else "success",
+            "status": (
+                "error"
+                if "error_message" in self.stats
+                else "partial_success" if int(self.stats["errors"]) > 0 else "success"
+            ),
             **self.stats,
         }
         print(json.dumps(result))

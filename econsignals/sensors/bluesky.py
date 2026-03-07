@@ -3,11 +3,12 @@
 Monitors economics discussion on Bluesky, linking posts to papers where possible.
 
 Primary approach: Authenticated API using BLUESKY_HANDLE + BLUESKY_APP_PASSWORD env vars.
-Fallback: Public API at public.api.bsky.app (no auth required, slightly limited).
+Fallback: Public API at public.api.bsky.app for author feeds only; search requires auth.
 
-Searches economics hashtags/keywords and fetches recent posts from tracked authors
-who have a bluesky_handle set in the authors table. Extracts DOIs from post text
-to link social items to papers already in the database.
+Searches economics hashtags/keywords when authenticated, and always fetches
+recent posts from tracked authors who have a bluesky_handle set in the authors
+table. Extracts DOIs from post text to link social items to papers already in
+the database.
 
 Usage:
     python sensors/bluesky.py
@@ -68,7 +69,8 @@ class BlueskySensor(BaseSensor):
     """Collect economics-related Bluesky posts and link them to papers.
 
     Authenticates via BLUESKY_HANDLE and BLUESKY_APP_PASSWORD environment
-    variables if available; otherwise uses the unauthenticated public API.
+    variables if available; otherwise uses the unauthenticated public API
+    for author feeds only.
 
     Overrides run() to insert social_items directly rather than routing
     through the paper dedup pipeline.
@@ -161,9 +163,6 @@ class BlueskySensor(BaseSensor):
     def _search_posts(self, query: str, auth_token: str | None = None) -> list[dict]:
         """Search Bluesky for posts matching a query string.
 
-        Uses the authenticated API base when a token is provided, otherwise
-        falls back to the public API.
-
         Args:
             query: Search query (hashtag or keyword string).
             auth_token: Optional Bearer JWT for authenticated requests.
@@ -171,9 +170,8 @@ class BlueskySensor(BaseSensor):
         Returns:
             List of raw post dicts from the API response, or empty list on error.
         """
-        base = _AUTH_BASE if auth_token else _PUBLIC_BASE
         params = urlencode({"q": query, "limit": _SEARCH_LIMIT})
-        url = f"{base}/app.bsky.feed.searchPosts?{params}"
+        url = f"{_AUTH_BASE}/app.bsky.feed.searchPosts?{params}"
 
         try:
             data = self.fetch_json(url, headers=self._auth_headers(auth_token))
@@ -368,6 +366,13 @@ class BlueskySensor(BaseSensor):
         Returns:
             List of social_item dicts.
         """
+        if not auth_token:
+            print(
+                "[bluesky] public API mode does not support searchPosts; skipping search",
+                file=sys.stderr,
+            )
+            return []
+
         seen_uris: set[str] = set()
         items: list[dict] = []
 

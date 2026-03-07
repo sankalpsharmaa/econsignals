@@ -53,7 +53,7 @@ FUNDING_SOURCES: dict[str, dict[str, str]] = {
     },
     "russell_sage": {
         "name": "Russell Sage Foundation",
-        "url": "https://www.russellsage.org/how-to-apply",
+        "url": "https://www.russellsage.org/apply",
         "org": "Russell Sage Foundation",
     },
     "sloan": {
@@ -350,12 +350,14 @@ class FundingSensor(BaseSensor):
         try:
             raw = self.fetch_url(url, timeout=45)
         except Exception as exc:
+            self.stats["errors"] = int(self.stats["errors"]) + 1
             print(f"[funding] fetch failed for {key} ({url}): {exc}", file=sys.stderr)
             return []
 
         try:
             html = raw.decode("utf-8", errors="replace")
         except Exception as exc:
+            self.stats["errors"] = int(self.stats["errors"]) + 1
             print(f"[funding] decode error for {key}: {exc}", file=sys.stderr)
             return []
 
@@ -476,9 +478,10 @@ class FundingSensor(BaseSensor):
                     self.stats["errors"] = int(self.stats["errors"]) + 1
                     print(f"[funding] upsert error: {exc}", file=sys.stderr)
 
+            run_status = "partial_success" if int(self.stats["errors"]) > 0 else "success"
             log_sensor_end(
                 run_id,
-                "success",
+                run_status,
                 int(self.stats["found"]),
                 int(self.stats["new"]),
             )
@@ -490,7 +493,11 @@ class FundingSensor(BaseSensor):
         result = {
             "sensor": self.name,
             "watch": self.watch,
-            "status": "error" if "error_message" in self.stats else "success",
+            "status": (
+                "error"
+                if "error_message" in self.stats
+                else "partial_success" if int(self.stats["errors"]) > 0 else "success"
+            ),
             **self.stats,
         }
         print(json.dumps(result))
