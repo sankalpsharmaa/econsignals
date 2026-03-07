@@ -1,0 +1,353 @@
+EconSignals Architecture
+========================
+
+Snapshot
+--------
+
+- Python package: `econsignals` at the repository root
+- Primary personalization path: Ollama embeddings via `nomic-embed-text`
+- Zotero corpus cache: `data/zotero_embedding_cache.pkl`
+- Fallback when Zotero or Ollama is unavailable: lexical author and term overlap
+- Core dependencies mentioned in the current build: `numpy`, `certifi`, `pytest`
+
+
+What EconSignals Does
+---------------------
+
+EconSignals is a personal research-intelligence pipeline for applied micro,
+development, and urban economists with an India focus. A standard daily run:
+
+1. collects papers, deadlines, and social posts from 20+ sources
+2. deduplicates overlapping records across those sources
+3. scores papers against a user profile based on JEL codes, keywords, authors,
+   recency, source quality, and social signal
+4. personalizes rankings using the user's Zotero library
+5. delivers a daily HTML and plain-text newsletter, with optional email sending
+
+
+End-to-End Flow
+---------------
+
+External sources
+~~~~~~~~~~~~~~~~
+
+- APIs: OpenAlex, Crossref
+- Scraped sources: IZA, BREAD, IMF, funding pages, conference pages
+- Social and discovery: Mastodon, Bluesky, Twitter/Exa bridge
+
+Processing pipeline
+~~~~~~~~~~~~~~~~~~~
+
+1. Sensor modules in `econsignals/sensors/` run in parallel.
+2. Each paper-like record flows through `econsignals/lib/dedup.py` via
+   `ingest_paper()`.
+3. Structured records are stored in `data/econsignals.db`.
+4. `econsignals/lib/relevance.py` computes `relevance_score` values in the
+   range `[0, 1]`.
+5. `econsignals/lenses/newsletter.py` gathers deadlines, papers, and social
+   items; applies Zotero personalization; renders newsletter outputs; and can
+   send email.
+6. `econsignals/lenses/deadline_alert.py` writes a separate markdown deadline
+   alerts file.
+
+Primary outputs
+~~~~~~~~~~~~~~~
+
+- `reports/YYYY-MM-DD/newsletter.html`
+- `reports/YYYY-MM-DD/newsletter.txt`
+- `reports/YYYY-MM-DD/deadline_alerts.md`
+- Email to `ECONSIGNALS_EMAIL_TO` when delivery is configured
+
+
+Daily Run Sequence
+------------------
+
+Phase 0. Bootstrap (`scripts/run_econsignals.sh`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Load `.env` from the project root when present.
+- Run `python3 -m econsignals.lib.db` to ensure the SQLite schema exists.
+
+Phase 1. Collection (`econsignals/sensors/*`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- `openalex`
+  Fetches economics works from the OpenAlex API, filters repository noise
+  (for example Zenodo or Figshare), parses title/authors/DOI/abstract/JEL
+  fields, and calls `ingest_paper()`.
+- `crossref`
+  Queries Crossref for economics journal tables of contents and ingests the
+  resulting article metadata.
+- `iza`
+  Scrapes the IZA discussion paper listing and detail pages, then ingests the
+  extracted metadata.
+- `bread`
+  Scrapes the BREAD working paper listing and ingests matched items.
+- `imf`
+  Tries the IMF eLibrary API first, then falls back to HTML scraping and Exa.
+- `funding`
+  Scrapes funding pages such as PEDL, STEG, IGC, NSF, and J-PAL, extracts
+  deadlines, and upserts them into the `deadlines` table.
+- `conferences`
+  Scrapes conference and call-for-papers pages such as NEUDC, PacDev, AEA, and
+  NBER Summer Institute, then upserts deadlines.
+- `mastodon`
+  Reads public and hashtag timelines from `econtwitter.net`, extracts DOIs,
+  links matching papers, and inserts social items.
+- `bluesky`
+  Searches economics hashtags, fetches tracked authors' posts, extracts DOIs,
+  and inserts social items.
+- `twitter_bridge`
+  Uses the Exa API for paper-announcement and funding/CFP queries, then parses
+  tweets for DOIs, deadlines, and social content.
+
+Phase 2. Deduplication (`econsignals/lib/dedup.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For each incoming paper:
+
+- Compute
+  `canonical_id = SHA256(normalize_title + sorted_author_lastnames)[:16]`
+- Run `find_existing_paper(title, authors, doi)` with this cascade:
+  1. DOI exact match
+  2. Exact normalized-title match
+  3. Fuzzy title match with `Jaccard >= 0.85`
+  4. Author-overlap fallback with `Jaccard >= 0.70` and at least two shared
+     last names
+- If a paper already exists:
+  - insert a new `paper_sources` row
+  - merge metadata, favoring stronger or longer fields where appropriate
+  - apply updates through `_apply_metadata_updates()`
+- If the paper is new:
+  - insert the paper
+  - insert the source record
+- For every author:
+  - upsert the author
+  - create the `paper_authors` link row
+
+Phase 3. Relevance scoring (`econsignals/lib/relevance.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Load `profile/jel_weights.json` for weighted JEL preferences.
+- Load `profile/identity.md` for keyword interests.
+- Score recent papers using a weighted combination of:
+  - JEL match score
+  - keyword overlap score
+  - tracked-author and coauthor proximity
+  - source prestige
+  - recency decay
+  - social signal
+  - India-specific boost
+- Persist the result with `update_paper_relevance(paper_id, score)`.
+
+Conceptually:
+
+`score_paper() =`
+`  W_JEL * jel_match_score`
+`+ W_KW * keyword_overlap_score`
+`+ W_AUTHOR * (tracked_author_score + coauthor_score)`
+`+ W_PRESTIGE * source_prestige`
+`+ W_RECENCY * recency_decay`
+`+ W_SOCIAL * social_signal`
+`+ INDIA_BOOST`
+
+Phase 4. Newsletter generation (`econsignals/lenses/newsletter.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Load the Zotero profile and Zotero corpus from
+   `~/Zotero/zotero.sqlite` or `ZOTERO_DB_PATH`.
+2. Gather upcoming deadlines over a 60-day horizon and compute `_days_left`.
+3. Gather recent papers:
+   - fetch one day of papers first, then widen to seven days if the candidate
+     set is too small
+   - filter to economics-relevant items
+   - attach a primary source
+4. Apply Zotero personalization:
+   - if a Zotero corpus is available, compute embedding scores with Ollama
+   - load cached corpus embeddings when the corpus hash matches
+   - compute candidate embeddings each run
+   - convert the result to `zotero_boost = min(score / 10, 0.7)`
+   - if Zotero or Ollama is unavailable, fall back to lexical author and
+     content overlap
+5. Rank papers with
+   `_rank = relevance_score + source_boost + zotero_boost`.
+6. Gather recent social items with per-source quotas and snippet deduplication.
+7. Update `relevance_score` with a small EMA nudge for papers that receive a
+   positive Zotero boost.
+8. Render:
+   - `newsletter.html`
+   - `newsletter.txt`
+9. Send email:
+   - try Resend first
+   - fall back to Gmail SMTP
+   - subject format: `EconSignals Daily - YYYY-MM-DD`
+
+Phase 5. Deadline alerts (`econsignals/lenses/deadline_alert.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Query upcoming deadlines over 60 days.
+- Group them by urgency thresholds.
+- Write `reports/YYYY-MM-DD/deadline_alerts.md`.
+
+
+Repository Layout
+-----------------
+
+`econsignals/sensors/`
+- `_base.py`: shared sensor primitives such as `BaseSensor`,
+  `RateLimiter`, and `CircuitBreaker`
+- `_exa.py`: Exa integration plus disk cache under `data/exa_cache/`
+- `openalex.py`, `crossref.py`, `iza.py`, `bread.py`, `imf.py`,
+  `funding.py`, `conferences.py`, `mastodon.py`, `bluesky.py`,
+  `twitter_bridge.py`: source-specific collectors
+
+`econsignals/lenses/`
+- `newsletter.py`: main daily newsletter generator and email delivery path
+- `deadline_alert.py`: markdown deadline-alert generator
+- `daily_brief.py`: concise briefing output for a lightweight daily summary
+
+`econsignals/lib/`
+- `db.py`: SQLite schema and persistence helpers
+- `dedup.py`: paper deduplication and metadata merge logic
+- `relevance.py`: scoring engine
+- `normalize.py`: title and author normalization utilities
+- `zotero_profile.py`: Zotero profile and corpus loading
+- `zotero_embeddings.py`: Ollama embedding calls and corpus caching
+
+Other top-level paths
+~~~~~~~~~~~~~~~~~~~~~
+
+- `profile/identity.md`: research interests and keyword profile
+- `profile/jel_weights.json`: JEL relevance weights
+- `watches/papers/state.json`: fetch state for watched sources
+- `watches/papers/intent.md`: watch configuration notes
+- `data/econsignals.db`: SQLite database
+- `data/exa_cache/`: Exa API response cache with a 12-hour TTL
+- `data/zotero_embedding_cache.pkl`: cached Zotero corpus embeddings
+- `reports/YYYY-MM-DD/`: generated daily outputs
+- `scripts/run_econsignals.sh`: end-to-end pipeline entry point
+- `scripts/view_econsignals_outputs.sh`: convenience viewer for generated output
+- `tests/`: automated tests
+
+
+Configuration
+-------------
+
+Required for a full run
+~~~~~~~~~~~~~~~~~~~~~~~
+
+- `ECONSIGNALS_EMAIL_TO`: newsletter recipient
+- `OPENALEX_EMAIL`: polite-pool identifier for higher OpenAlex rate limits
+
+Optional sensor and storage settings
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- `EXA_API_KEY`: enables the Twitter bridge and IMF fallback search
+- `ECONSIGNALS_DB`: overrides the default database path
+- `ZOTERO_DB_PATH`: overrides the default Zotero database path
+- `OLLAMA_HOST`: overrides the Ollama API URL
+
+Optional email settings
+~~~~~~~~~~~~~~~~~~~~~~~
+
+- `RESEND_API_KEY`: preferred email delivery path
+- `GMAIL_APP_PASSWORD`: Gmail SMTP fallback
+
+
+Database Schema
+---------------
+
+- `papers`
+  Core paper record with `canonical_id`, title fields, abstract, DOI, URL,
+  publication date, paper type, JEL codes, keywords, `relevance_score`, and
+  `first_seen_at`.
+- `paper_sources`
+  Links a paper to one or more sources with source IDs, source URLs, and raw
+  metadata payloads.
+- `authors`
+  Author identity table, including normalized names, external IDs, tracking
+  flags, handles, and relevance metadata.
+- `paper_authors`
+  Join table from papers to authors with author position.
+- `social_items`
+  Social posts tied to a source, author handle, content, URL, optional paper
+  link, engagement score, and publication timestamp.
+- `deadlines`
+  Funding, conference, and CFP deadlines, including dates, organization,
+  descriptions, and relevance metadata.
+- `sensor_runs`
+  Operational log for sensor executions, including status, counts, and error
+  messages.
+
+
+Zotero Personalization
+----------------------
+
+1. Profile loading (`econsignals/lib/zotero_profile.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Opens `~/Zotero/zotero.sqlite` in read-only mode, unless `ZOTERO_DB_PATH`
+  overrides it.
+- `load_zotero_profile()` returns `authors_full`, `authors_last`, `terms`, and
+  `doi_set` for the lexical fallback path.
+- `load_zotero_corpus()` returns up to 500 records of the form
+  `{title, abstract, text, date_added}`.
+- The corpus is sorted by `date_added` descending.
+- Lexical helpers exposed here include `zotero_author_score()` and
+  `zotero_content_score()`.
+
+2. Embedding scoring (`econsignals/lib/zotero_embeddings.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- `compute_zotero_embedding_scores(candidates, corpus)` returns a list of
+  personalization scores.
+- Embeddings are requested from Ollama at `POST /api/embeddings` using the
+  `nomic-embed-text` model.
+- Corpus embeddings are cached in `data/zotero_embedding_cache.pkl`.
+- Cache invalidation is content-based: the cache key is a SHA256 hash of the
+  corpus text.
+- On a cache miss, the system embeds the full corpus and writes the cache.
+- On a cache hit, it reuses cached corpus vectors and only embeds candidates.
+- Candidate scoring uses cosine similarity with recency weights
+  `1 / (1 + log10(i + 1))`.
+- The final embedding score is the weighted sum multiplied by 10.
+
+3. Newsletter integration (`econsignals/lenses/newsletter.py`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- If a corpus is available:
+  `zotero_boost = min(embedding_score / 10, 0.7)`
+- Otherwise:
+  `zotero_boost = 0.4 * author_score + 0.3 * content_score`
+- Final paper ranking is based on:
+  `_rank = relevance_score + source_boost + zotero_boost`
+- The newsletter pass then nudges `relevance_score` upward for papers with
+  positive Zotero support using `alpha = 0.05`.
+
+Operational notes
+~~~~~~~~~~~~~~~~~
+
+- Ollama must be running, typically via `ollama serve`.
+- The `nomic-embed-text` model must already be available locally.
+- A cached run usually embeds only candidate papers.
+- The first run, or any run after the Zotero corpus changes, also embeds the
+  full corpus.
+
+
+Implemented and Possible Next Steps
+-----------------------------------
+
+Implemented today
+~~~~~~~~~~~~~~~~~
+
+- Semantic embeddings with Ollama as the primary personalization path
+- Recency weighting so newer Zotero items influence rankings more
+- Corpus embedding cache invalidated on Zotero content changes
+- Lexical fallback when Zotero or Ollama is unavailable
+
+Potential future improvements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Citation-based signals such as "papers that cite papers already in Zotero"
+- Tag- or collection-aware weighting from Zotero organization metadata
+- Per-item candidate embedding cache keyed by DOI or another stable identifier

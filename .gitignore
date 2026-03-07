@@ -1,7 +1,13 @@
 .env
 data/*.db
 data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/exa_cache/
+data/zotero_embedding_cache.pkl
+data/zotero_rag_dense_cache.json
 reports/
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store

@@ -1,0 +1,10 @@
+# EconSignals dependencies
+# Core (used by sensors/lenses)
+certifi>=2023.0.0
+numpy>=1.24.0
+
+# Zotero personalization (embedding-based reranking via Ollama)
+# Uses OLLAMA_HOST (default localhost:11434) + nomic-embed-text
+
+# Testing
+pytest>=7.0.0
