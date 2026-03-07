@@ -54,8 +54,11 @@ Generate and email the daily newsletter.
 | Variable | Description |
 |-|-|
 | `ECONSIGNALS_EMAIL_TO` | Recipient email |
+| `ECONSIGNALS_EMAIL_FROM` | Shared sender address for email providers (optional convenience var) |
+| `GMAIL_EMAIL` | Gmail sender/login address for SMTP fallback |
 | `GMAIL_APP_PASSWORD` | Gmail app password (recommended — [generate here](https://myaccount.google.com/apppasswords)) |
 | `RESEND_API_KEY` | *Alternative:* Resend API key (needs domain verification) |
+| `RESEND_EMAIL_FROM` | Verified Resend sender address |
 
 Tries Resend first, falls back to Gmail SMTP. Without either, newsletter is generated locally only.
 

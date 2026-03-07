@@ -251,7 +251,10 @@ Optional email settings
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 - `RESEND_API_KEY`: preferred email delivery path
+- `RESEND_EMAIL_FROM`: verified sender address for Resend
+- `ECONSIGNALS_EMAIL_FROM`: shared sender address fallback for email providers
 - `GMAIL_APP_PASSWORD`: Gmail SMTP fallback
+- `GMAIL_EMAIL`: Gmail sender/login address for SMTP fallback
 
 
 Database Schema
