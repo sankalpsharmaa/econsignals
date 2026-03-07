@@ -5,8 +5,11 @@ Generates a concise, hyperlinked newsletter with three sections:
   2. Top Papers
   3. Social Feed Highlights
 
-Email delivery via Resend (https://resend.com) — just two env vars:
+Email delivery via Resend (https://resend.com) or Gmail SMTP:
     RESEND_API_KEY          Your Resend API key
+    RESEND_EMAIL_FROM       Verified Resend sender address (or ECONSIGNALS_EMAIL_FROM)
+    GMAIL_APP_PASSWORD      Gmail app password
+    GMAIL_EMAIL             Gmail sender address (or ECONSIGNALS_EMAIL_FROM)
     ECONSIGNALS_EMAIL_TO    Recipient email
 
 Usage:
@@ -521,7 +524,7 @@ def _send_resend(html: str, plain: str, to: str) -> bool:
         return False
 
     payload = {
-        "from": sender,
+        "from": f"EconSignals <{sender}>",
         "to": [to],
         "subject": f"EconSignals Daily — {date.today().isoformat()}",
         "html": html,
@@ -561,19 +564,33 @@ def _send_gmail(html: str, plain: str, to: str) -> bool:
     app_pass = (os.environ.get("GMAIL_APP_PASSWORD") or "").strip()
     if not app_pass:
         return False
+    sender = (
+        os.environ.get("GMAIL_EMAIL")
+        or os.environ.get("ECONSIGNALS_EMAIL_FROM")
+        or ""
+    ).strip()
+    if not sender:
+        print(
+            "[newsletter] GMAIL_EMAIL or ECONSIGNALS_EMAIL_FROM not set — skipping Gmail SMTP",
+            file=sys.stderr,
+        )
+        return False
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"EconSignals Daily — {date.today().isoformat()}"
-    msg["From"] = to
+    msg["From"] = sender
     msg["To"] = to
     msg.attach(MIMEText(plain, "plain", "utf-8"))
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-            server.login(to, app_pass)
+            server.login(sender, app_pass)
             server.send_message(msg)
-        print(f"[newsletter] email sent via Gmail to {to}", file=sys.stderr)
+        print(
+            f"[newsletter] email sent via Gmail from {sender} to {to}",
+            file=sys.stderr,
+        )
         return True
     except Exception as exc:
         print(f"[newsletter] Gmail SMTP failed: {exc}", file=sys.stderr)
