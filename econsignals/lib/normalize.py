@@ -14,8 +14,23 @@ import unicodedata
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Non-decomposable letters that NFKD + ascii-ignore would silently delete
+# (e.g. "Tyskø" -> "Tysk"). Transliterate them so the letter survives.
+_TRANSLIT_MAP = str.maketrans({
+    "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D",
+    "ł": "l", "Ł": "L", "ß": "ss", "æ": "ae", "Æ": "AE",
+    "œ": "oe", "Œ": "OE", "þ": "th", "Þ": "Th", "ı": "i", "ŋ": "ng",
+})
+
+
 def _strip_accents(s: str) -> str:
-    """NFKD decomposition, drop non-ASCII combining marks."""
+    """Transliterate non-decomposable letters, then NFKD-drop combining marks.
+
+    Plain NFKD + ascii-ignore deletes letters that have no decomposition (ø, đ,
+    ł, ß, ...), mangling names like "Tyskø" into "Tysk". Mapping them to an ASCII
+    equivalent first preserves a usable token.
+    """
+    s = s.translate(_TRANSLIT_MAP)
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
 
 

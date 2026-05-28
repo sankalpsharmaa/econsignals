@@ -18,8 +18,12 @@ _BASE_URL = "https://www.iza.org"
 _LISTING_URL = "https://www.iza.org/publications/dp"
 _STATE_PATH = PROJ_ROOT / "watches" / "papers" / "state.json"
 
-_MAX_PAGES = 5
-_DETAIL_BUDGET = 15
+# 15 pages (~300 papers) lets a one-time backlog fully paginate; the
+# page_old early-break keeps steady-state daily runs to ~2 pages.
+_MAX_PAGES = 15
+# authors now come from the listing, so detail fetches only enrich
+# abstract/date/JEL; budget bounds the one-time backlog enrichment.
+_DETAIL_BUDGET = 50
 _DEFAULT_LOOKBACK_DAYS = 30
 _PAPERS_PER_PAGE = 20
 
@@ -129,28 +133,41 @@ def _parse_authors(raw: str) -> list[str]:
 
 
 class _ListingParser(HTMLParser):
-    """Parse listing cards from IZA discussion paper pages."""
+    """Parse listing cards from IZA discussion paper pages.
+
+    IZA wraps each paper in an ``<article>`` element with Tailwind utility
+    classes (no semantic field classes). Per article:
+      - dp_number + url come from the ``/publications/dp/NNNNN`` anchor;
+      - title is the inner text of that same anchor;
+      - authors are the article's residual text once the DP-number badge and
+        the title are removed (this captures both plain-text names and the
+        person-/external-link author anchors).
+    Abstract and date are not in the listing and are fetched per detail page.
+
+    A title-only anchor scan runs as a degraded fallback for any DP links that
+    fall outside an ``<article>`` boundary.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.items: list[dict] = []
         self.fallback_items: list[dict] = []
 
-        self._in_card = False
-        self._card_depth = 0
+        # state for the current <article> card
         self._current: dict | None = None
-
-        self._capture_field: str | None = None
-        self._capture_depth = 0
+        self._depth = 0
         self._buf: list[str] = []
 
+        # state for capturing the title anchor's inner text
+        self._title_anchor_depth: int | None = None
+        self._title_buf: list[str] = []
+
+        # state for the degraded title-only anchor fallback
         self._in_fallback_anchor = False
         self._fallback_href = ""
         self._fallback_buf: list[str] = []
 
     def _start_card(self) -> None:
-        self._in_card = True
-        self._card_depth = 0
         self._current = {
             "dp_number": 0,
             "title": "",
@@ -159,55 +176,31 @@ class _ListingParser(HTMLParser):
             "date_raw": "",
             "url": "",
         }
-        self._capture_field = None
-        self._capture_depth = 0
+        self._depth = 0
         self._buf = []
-
-    def _start_capture(self, field: str) -> None:
-        self._capture_field = field
-        self._capture_depth = 0
-        self._buf = []
-
-    def _append_start_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._buf.append(f"<{tag}")
-        for key, value in attrs:
-            safe = "" if value is None else value
-            self._buf.append(f' {key}="{safe}"')
-        self._buf.append(">")
-
-    def _finalize_capture(self) -> None:
-        if self._current is None or self._capture_field is None:
-            self._capture_field = None
-            self._capture_depth = 0
-            self._buf = []
-            return
-
-        raw_text = "".join(self._buf).strip()
-        if self._capture_field == "category":
-            m = _RE_DP_TEXT.search(_strip_html(raw_text))
-            if m:
-                self._current["dp_number"] = int(m.group(1))
-        elif self._capture_field == "title":
-            self._current["title"] = _strip_html(raw_text)
-        elif self._capture_field == "authors_raw":
-            self._current["authors_raw"] = raw_text
-        elif self._capture_field == "abstract_raw":
-            self._current["abstract_raw"] = raw_text
-        elif self._capture_field == "date_raw":
-            self._current["date_raw"] = _strip_html(raw_text)
-
-        self._capture_field = None
-        self._capture_depth = 0
-        self._buf = []
+        self._title_anchor_depth = None
+        self._title_buf = []
 
     def _finalize_card(self) -> None:
         if self._current is None:
             return
 
+        # derive authors from the article's residual text: full card text
+        # minus the DP-number badge minus the title
+        full = _strip_html("".join(self._buf))
+        title = re.sub(r"\s+", " ", "".join(self._title_buf)).strip()
+        self._current["title"] = title
+
+        residual = _RE_DP_TEXT.sub("", full)
+        residual = re.sub(
+            r"IZA\s+Discussion\s+Paper\s+No\.?", "", residual, flags=re.IGNORECASE
+        )
+        if title:
+            residual = residual.replace(title, "")
+        self._current["authors_raw"] = residual
+
         dp_number = int(self._current.get("dp_number") or 0)
         url = (self._current.get("url") or "").strip()
-        title = (self._current.get("title") or "").strip()
-
         if not dp_number and url:
             m = _RE_DP_HREF.search(url)
             if m:
@@ -220,55 +213,41 @@ class _ListingParser(HTMLParser):
                 self._current["url"] = url
             self.items.append(self._current)
 
-        self._in_card = False
-        self._card_depth = 0
         self._current = None
-        self._capture_field = None
-        self._capture_depth = 0
+        self._depth = 0
         self._buf = []
+        self._title_anchor_depth = None
+        self._title_buf = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_l = tag.lower()
         attr_map = dict(attrs)
-        cls = (attr_map.get("class") or "").lower()
 
-        if tag_l == "div" and "list-element" in cls:
+        # each paper is one <article>; start a fresh card on its open tag
+        if tag_l == "article":
             self._start_card()
             return
 
-        if self._in_card:
-            if self._capture_field is not None:
-                self._capture_depth += 1
-                self._append_start_tag(tag_l, attrs)
-
-            if tag_l == "div":
-                self._card_depth += 1
-                if "category" in cls:
-                    self._start_capture("category")
-                elif "title" in cls:
-                    self._start_capture("title")
-                elif "authors" in cls:
-                    self._start_capture("authors_raw")
-                elif (
-                    "abstract" in cls
-                    or "teaser" in cls
-                    or "description" in cls
-                    or "summary" in cls
-                ):
-                    self._start_capture("abstract_raw")
-                elif "date" in cls or "published" in cls:
-                    self._start_capture("date_raw")
-                return
+        if self._current is not None:
+            # track nesting so we know when the title anchor closes
+            self._depth += 1
+            # a space keeps adjacent text tokens from fusing across tags
+            self._buf.append(" ")
 
             if tag_l == "a":
                 href = attr_map.get("href") or ""
                 m = _RE_DP_HREF.search(href)
-                if m and self._current is not None:
+                if m:
                     self._current["url"] = urljoin(_BASE_URL, href)
                     if not self._current.get("dp_number"):
                         self._current["dp_number"] = int(m.group(1))
+                    # the first DP anchor wraps the title; capture its text
+                    if self._title_anchor_depth is None:
+                        self._title_anchor_depth = self._depth
+                        self._title_buf = []
             return
 
+        # outside any article: arm the degraded title-only anchor fallback
         if tag_l == "a":
             href = attr_map.get("href") or ""
             if _RE_DP_HREF.search(href):
@@ -279,19 +258,20 @@ class _ListingParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag_l = tag.lower()
 
-        if self._in_card:
-            if self._capture_field is not None:
-                if self._capture_depth > 0:
-                    self._capture_depth -= 1
-                    self._buf.append(f"</{tag_l}>")
-                elif tag_l == "div":
-                    self._finalize_capture()
+        if tag_l == "article" and self._current is not None:
+            self._finalize_card()
+            return
 
-            if tag_l == "div":
-                if self._card_depth == 0:
-                    self._finalize_card()
-                else:
-                    self._card_depth -= 1
+        if self._current is not None:
+            # close the title anchor when it returns to its opening depth
+            if (
+                self._title_anchor_depth is not None
+                and tag_l == "a"
+                and self._depth == self._title_anchor_depth
+            ):
+                self._title_anchor_depth = None
+            if self._depth > 0:
+                self._depth -= 1
             return
 
         if tag_l == "a" and self._in_fallback_anchor:
@@ -313,20 +293,26 @@ class _ListingParser(HTMLParser):
             self._fallback_buf = []
 
     def handle_data(self, data: str) -> None:
-        if self._capture_field is not None:
+        if self._current is not None:
             self._buf.append(data)
+            if self._title_anchor_depth is not None:
+                self._title_buf.append(data)
         elif self._in_fallback_anchor:
             self._fallback_buf.append(data)
 
     def handle_entityref(self, name: str) -> None:  # type: ignore[override]
-        if self._capture_field is not None:
+        if self._current is not None:
             self._buf.append(f"&{name};")
+            if self._title_anchor_depth is not None:
+                self._title_buf.append(f"&{name};")
         elif self._in_fallback_anchor:
             self._fallback_buf.append(f"&{name};")
 
     def handle_charref(self, name: str) -> None:  # type: ignore[override]
-        if self._capture_field is not None:
+        if self._current is not None:
             self._buf.append(f"&#{name};")
+            if self._title_anchor_depth is not None:
+                self._title_buf.append(f"&#{name};")
         elif self._in_fallback_anchor:
             self._fallback_buf.append(f"&#{name};")
 
@@ -336,6 +322,8 @@ def _parse_detail_page(html: str) -> dict:
     result: dict = {}
 
     for pattern in (
+        # IZA's full abstract lives in the cms-richtext copy block
+        r'class="[^"]*cms-richtext[^"]*"[^>]*>(.*?)</div>',
         r'class="[^"]*abstract[^"]*"[^>]*>(.*?)</(?:div|section|p)',
         r'id="[^"]*abstract[^"]*"[^>]*>(.*?)</(?:div|section|p)',
     ):
@@ -404,17 +392,30 @@ def _parse_detail_page(html: str) -> dict:
         if doi_match2:
             result["doi"] = doi_match2.group(0).rstrip(").,;")
 
-    for pattern in (
-        r'class="[^"]*authors?[^"]*"[^>]*>(.*?)</(?:div|p|span)',
-        r'<meta[^>]+name=["\']author["\'][^>]+content=["\'](.*?)["\']',
-    ):
-        m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-        if not m:
-            continue
-        authors = _parse_authors(m.group(1))
+    # IZA detail pages have no author class/meta; names live only in
+    # /person/NNNNN anchors. This is a fallback -- listing authors are primary.
+    person_names = re.findall(
+        r"<a [^>]*href=['\"][^'\"]*/person/\d+[^'\"]*['\"][^>]*>([^<]+)</a>",
+        html,
+        re.IGNORECASE,
+    )
+    if person_names:
+        authors = _parse_authors(", ".join(person_names))
         if authors:
             result["authors"] = authors
-            break
+
+    if "authors" not in result:
+        for pattern in (
+            r'class="[^"]*authors?[^"]*"[^>]*>(.*?)</(?:div|p|span)',
+            r'<meta[^>]+name=["\']author["\'][^>]+content=["\'](.*?)["\']',
+        ):
+            m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            authors = _parse_authors(m.group(1))
+            if authors:
+                result["authors"] = authors
+                break
 
     return result
 
@@ -575,6 +576,12 @@ class IZASensor(BaseSensor):
                     seen_source_ids.add(source_id)
                     max_dp_seen = max(max_dp_seen, dp_number)
 
+                    # skip already-ingested papers before spending detail budget;
+                    # still count them so the page_old early-break can fire
+                    if dp_number <= last_dp:
+                        page_old += 1
+                        continue
+
                     source_url = (card.get("url") or f"{_BASE_URL}/publications/dp/{dp_number}").strip()
                     source_url = urljoin(_BASE_URL, source_url)
 
@@ -601,9 +608,9 @@ class IZASensor(BaseSensor):
                     if detail.get("doi"):
                         doi = detail["doi"]
 
+                    # state-based skip already handled above; only date remains
                     is_old_by_date = bool(published_at and published_at < from_date)
-                    is_old_by_state = dp_number <= last_dp
-                    if is_old_by_date or is_old_by_state:
+                    if is_old_by_date:
                         page_old += 1
                         continue
 

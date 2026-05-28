@@ -11,3 +11,17 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+
+# Backups and runtime feedback log
+data/*.bak*
+data/feedback.jsonl
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Web dashboard build artifacts (webapp/public/feed.json IS committed)
+webapp/node_modules/
+webapp/dist/
+.ruff_cache/

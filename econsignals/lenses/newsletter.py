@@ -499,16 +499,24 @@ def generate_plain(
 
 
 def _resend_sender() -> str | None:
-    sender = (os.environ.get("RESEND_FROM") or "").strip()
-    if sender:
-        return sender
+    """Resolve the Resend From header from configured env vars.
 
-    sender_email = (os.environ.get("RESEND_FROM_EMAIL") or "").strip()
-    if not sender_email:
+    Reads RESEND_EMAIL_FROM (preferred) or ECONSIGNALS_EMAIL_FROM (shared
+    fallback) — the names documented in CLAUDE.md. A bare email is wrapped with
+    the EconSignals display name; an already-formatted "Name <addr>" value is
+    used verbatim. Returns None when neither is set.
+    """
+    sender = (
+        os.environ.get("RESEND_EMAIL_FROM")
+        or os.environ.get("ECONSIGNALS_EMAIL_FROM")
+        or os.environ.get("RESEND_FROM")
+        or ""
+    ).strip()
+    if not sender:
         return None
-
-    sender_name = (os.environ.get("RESEND_FROM_NAME") or "").strip() or "EconSignals"
-    return f"{sender_name} <{sender_email}>"
+    if "<" in sender:
+        return sender
+    return f"EconSignals <{sender}>"
 
 
 def _send_resend(html: str, plain: str, to: str) -> bool:
@@ -518,13 +526,14 @@ def _send_resend(html: str, plain: str, to: str) -> bool:
     sender = _resend_sender()
     if not sender:
         print(
-            "[newsletter] Resend sender not configured; set RESEND_FROM or RESEND_FROM_EMAIL",
+            "[newsletter] skipping Resend: sender not configured; "
+            "set RESEND_EMAIL_FROM or ECONSIGNALS_EMAIL_FROM",
             file=sys.stderr,
         )
         return False
 
     payload = {
-        "from": f"EconSignals <{sender}>",
+        "from": sender,
         "to": [to],
         "subject": f"EconSignals Daily — {date.today().isoformat()}",
         "html": html,

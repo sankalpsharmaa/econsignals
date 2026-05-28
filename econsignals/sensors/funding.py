@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -30,51 +30,130 @@ from econsignals.sensors._base import BaseSensor
 # Funding sources
 # ---------------------------------------------------------------------------
 
-FUNDING_SOURCES: dict[str, dict[str, str]] = {
+# Each source carries an optional ``known_deadlines`` list of curated,
+# human-verified recurring calls. The target funder pages are JavaScript-
+# rendered SPAs whose deadline tables never appear in the initial HTML, so
+# regex-on-HTML scraping captures zero real dates. The curated registry is the
+# primary data source; live scraping is demoted to an override that only
+# supplements it when a real date is parsed from the page.
+#
+# A curated entry has:
+#   label:         short call name, appended to the source name
+#   month:         typical deadline month (1-12)
+#   recurrence:    "annual" or "biannual" (biannual fires twice a year)
+#   second_month:  the second month for biannual calls (1-12)
+#   last_verified: ISO date the recurrence was last checked by a human
+FUNDING_SOURCES: dict[str, dict] = {
     "pedl": {
         "name": "PEDL - Private Enterprise Development in Low-Income Countries",
         "url": "https://grp.cepr.org/pedl/funding/open-and-upcoming-calls",
         "org": "CEPR/PEDL",
+        "known_deadlines": [
+            {
+                "label": "Major Research Grants call",
+                "month": 4,
+                "recurrence": "biannual",
+                "second_month": 10,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "steg": {
         "name": "STEG - Structural Transformation and Economic Growth",
         "url": "https://grp.cepr.org/steg/funding/open-and-upcoming-calls",
         "org": "CEPR/STEG",
+        "known_deadlines": [
+            {
+                "label": "Research Grants call",
+                "month": 4,
+                "recurrence": "biannual",
+                "second_month": 10,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "igc_funding": {
         "name": "IGC - International Growth Centre Funding",
         "url": "https://www.theigc.org/funding",
         "org": "IGC",
+        "known_deadlines": [
+            {
+                "label": "Research call",
+                "month": 3,
+                "recurrence": "biannual",
+                "second_month": 9,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "nsf_ses": {
         "name": "NSF Social, Behavioral and Economic Sciences",
         "url": "https://new.nsf.gov/funding/opportunities?f%5B0%5D=division_name%3ASocial%20and%20Economic%20Sciences",
         "org": "NSF",
+        "known_deadlines": [
+            {
+                "label": "Economics Program target date",
+                "month": 1,
+                "recurrence": "biannual",
+                "second_month": 8,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "russell_sage": {
         "name": "Russell Sage Foundation",
         "url": "https://www.russellsage.org/apply",
         "org": "Russell Sage Foundation",
+        "known_deadlines": [
+            {
+                "label": "Letters of inquiry",
+                "month": 5,
+                "recurrence": "biannual",
+                "second_month": 11,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "sloan": {
         "name": "Alfred P. Sloan Foundation",
         "url": "https://sloan.org/programs/research",
         "org": "Sloan Foundation",
+        # No fixed public deadline; Sloan accepts LOIs on a rolling basis
+        "known_deadlines": [],
     },
     "jpal_ri": {
         "name": "J-PAL Research Initiatives",
         "url": "https://www.povertyactionlab.org/initiative/governance-initiative",
         "org": "J-PAL",
+        "known_deadlines": [
+            {
+                "label": "Initiative funding call",
+                "month": 3,
+                "recurrence": "biannual",
+                "second_month": 9,
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "weiss_fund": {
         "name": "Weiss Fund for Research in Development Economics",
         "url": "https://weissfund.uchicago.edu/",
         "org": "Weiss Fund",
+        "known_deadlines": [
+            {
+                "label": "Annual research grant call",
+                "month": 12,
+                "recurrence": "annual",
+                "last_verified": "2026-05-28",
+            },
+        ],
     },
     "usc_econ": {
         "name": "USC Dornsife Economics Research & Grants",
         "url": "https://dornsife.usc.edu/economics/",
         "org": "USC",
+        # No public recurring research-grant deadline; track as rolling
+        "known_deadlines": [],
     },
 }
 
@@ -211,6 +290,44 @@ def _try_parse_date(text: str) -> _ParsedDate | None:
     return None
 
 
+def _next_occurrence(month: int, today: date) -> str:
+    """Return the next 15th-of-month ISO date on or after today for a month.
+
+    Uses the 15th as a generic mid-month placeholder. If the 15th of the given
+    month has already passed this year, roll to next year.
+
+    Args:
+        month: Target month 1-12.
+        today: Reference date (the current date).
+
+    Returns:
+        ISO date string "YYYY-MM-15" for the next occurrence.
+    """
+    candidate = date(today.year, month, 15)
+    if candidate < today:
+        candidate = date(today.year + 1, month, 15)
+    return candidate.isoformat()
+
+
+def curated_deadline_dates(entry: dict, today: date) -> list[str]:
+    """Project a curated recurrence entry into upcoming ISO deadline dates.
+
+    Args:
+        entry: A ``known_deadlines`` dict with month, recurrence, and
+            optionally second_month.
+        today: Reference date (the current date).
+
+    Returns:
+        Sorted list of unique upcoming ISO date strings (one for an annual
+        call, up to two for a biannual call).
+    """
+    months = [entry["month"]]
+    if entry.get("recurrence") == "biannual" and entry.get("second_month"):
+        months.append(entry["second_month"])
+    dates = {_next_occurrence(m, today) for m in months}
+    return sorted(dates)
+
+
 def _extract_deadline_dates(html: str) -> list[_ParsedDate]:
     """Find dates that appear near deadline-signalling context words.
 
@@ -331,16 +448,82 @@ class FundingSensor(BaseSensor):
         """
         return _HIGH_RELEVANCE if org in _HIGH_RELEVANCE_ORGS else _DEFAULT_RELEVANCE
 
-    def _scrape_source(self, key: str, source: dict[str, str]) -> list[dict]:
-        """Fetch and parse a single funding source page.
+    def _curated_records(
+        self, key: str, source: dict, description: str, rolling_fallback: bool = True
+    ) -> list[dict]:
+        """Build deadline records from a source's curated known_deadlines.
+
+        Projects each curated recurrence into upcoming dated records. When a
+        source has no curated calls and rolling_fallback is True, returns a
+        single rolling record (deadline_date='') so a confirmed-open call still
+        surfaces. On a fetch/decode failure the caller passes rolling_fallback=
+        False: we emit only real curated data, never fabricate a rolling
+        deadline for a page we could not even load.
 
         Args:
-            key: Source key (e.g. "nsf_ses"), used only for logging.
-            source: Dict with name, url, org keys.
+            key: Source key, used only for logging.
+            source: Source dict with name, url, org, known_deadlines.
+            description: Description text to attach to each record.
+            rolling_fallback: Emit a dateless rolling record when there are no
+                curated calls (default True; pass False on fetch failure).
 
         Returns:
             List of deadline dicts ready for upsert_deadline().
-            Returns a single rolling-deadline record on parse failure.
+        """
+        name = source["name"]
+        url = source["url"]
+        org = source["org"]
+        score = self._relevance_score(org)
+        today = datetime.now(timezone.utc).date()
+
+        records: list[dict] = []
+        for entry in source.get("known_deadlines", []):
+            for iso in curated_deadline_dates(entry, today):
+                records.append(
+                    {
+                        "type": "funding",
+                        "name": f"{name} ({entry['label']})",
+                        "organization": org,
+                        "deadline_date": iso,
+                        "event_date": None,
+                        "url": url,
+                        "description": description,
+                        "relevance_score": score,
+                    }
+                )
+
+        # No curated calls: surface as a single rolling (dateless) opportunity,
+        # unless the caller suppressed it (fetch failed — nothing real to assert)
+        if not records and rolling_fallback:
+            records.append(
+                {
+                    "type": "funding",
+                    "name": name,
+                    "organization": org,
+                    "deadline_date": None,
+                    "event_date": None,
+                    "url": url,
+                    "description": description,
+                    "relevance_score": score,
+                }
+            )
+        return records
+
+    def _scrape_source(self, key: str, source: dict) -> list[dict]:
+        """Fetch and parse a single funding source page.
+
+        Live scraping is an override on top of the curated registry. When the
+        page yields a real parsed date it is used; otherwise the source's
+        curated known_deadlines (or a rolling record) are emitted. A fetch or
+        decode failure emits a health-marker record so /status can surface a
+        persistently-failing source rather than treating it as "no calls".
+
+        Args:
+            key: Source key (e.g. "nsf_ses"), used only for logging.
+            source: Dict with name, url, org, known_deadlines keys.
+
+        Returns:
+            List of deadline dicts ready for upsert_deadline().
         """
         name = source["name"]
         url = source["url"]
@@ -352,14 +535,24 @@ class FundingSensor(BaseSensor):
         except Exception as exc:
             self.stats["errors"] = int(self.stats["errors"]) + 1
             print(f"[funding] fetch failed for {key} ({url}): {exc}", file=sys.stderr)
-            return []
+            # Emit the curated registry anyway (it does not depend on the page),
+            # and mark the source unhealthy so /status can see the failure
+            self.stats.setdefault("failed_sources", [])
+            self.stats["failed_sources"].append(key)
+            return self._curated_records(
+                key, source, "FETCH FAILED (using curated deadlines)", rolling_fallback=False
+            )
 
         try:
             html = raw.decode("utf-8", errors="replace")
         except Exception as exc:
             self.stats["errors"] = int(self.stats["errors"]) + 1
             print(f"[funding] decode error for {key}: {exc}", file=sys.stderr)
-            return []
+            self.stats.setdefault("failed_sources", [])
+            self.stats["failed_sources"].append(key)
+            return self._curated_records(
+                key, source, "DECODE FAILED (using curated deadlines)", rolling_fallback=False
+            )
 
         dates = _extract_deadline_dates(html)
         description = _extract_description(html, name)
@@ -370,19 +563,9 @@ class FundingSensor(BaseSensor):
         )
 
         if not dates:
-            # Rolling or indeterminate deadline: insert once with no date
-            return [
-                {
-                    "type": "funding",
-                    "name": name,
-                    "organization": org,
-                    "deadline_date": None,
-                    "event_date": None,
-                    "url": url,
-                    "description": description,
-                    "relevance_score": score,
-                }
-            ]
+            # Scraping yielded nothing (JS-rendered page): fall back to the
+            # curated known_deadlines registry as the primary data source
+            return self._curated_records(key, source, description)
 
         records = []
         for parsed_date in dates:

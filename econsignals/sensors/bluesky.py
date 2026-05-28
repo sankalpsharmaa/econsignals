@@ -59,6 +59,9 @@ _RE_NBER = re.compile(r"nber\.org/papers/(w\d+)", re.IGNORECASE)
 # arXiv IDs
 _RE_ARXIV = re.compile(r"arxiv\.org/abs/(\d{4}\.\d{4,5})", re.IGNORECASE)
 
+# Econ hashtags that, when present, qualify a post regardless of keyword match.
+_ECON_HASHTAGS: tuple[str, ...] = ("#econ", "#economics", "#econsky", "#devecon")
+
 
 # ---------------------------------------------------------------------------
 # Sensor
@@ -93,6 +96,17 @@ class BlueskySensor(BaseSensor):
         "working paper",
         "NBER",
     ]
+
+    def __init__(self) -> None:
+        """Initialise the sensor and cache the profile interest keywords.
+
+        load_interest_keywords() self-caches at module level, but caching the
+        set on the instance avoids the repeated import in the per-post gate.
+        """
+        super().__init__()
+        from econsignals.lib.relevance import load_interest_keywords
+
+        self._interest_kw: set[str] = load_interest_keywords()
 
     # ------------------------------------------------------------------
     # Authentication
@@ -259,7 +273,7 @@ class BlueskySensor(BaseSensor):
         if not doi:
             return None
 
-            from econsignals.lib.db import find_paper_by_doi
+        from econsignals.lib.db import find_paper_by_doi
 
         # Normalise: strip leading doi.org prefix if present
         doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
@@ -272,6 +286,38 @@ class BlueskySensor(BaseSensor):
             print(f"[bluesky] paper lookup error for doi={doi}: {exc}", file=sys.stderr)
 
         return None
+
+    def _passes_econ_gate(self, content_text: str, doi: str | None) -> bool:
+        """Decide whether a post is econ-relevant enough to ingest.
+
+        A post qualifies if ANY of the following holds:
+          - it carries a DOI (paper enrichment, treated as a strong signal),
+          - it contains an econ hashtag (#econ, #economics, #econsky, #devecon),
+          - its text matches a profile interest keyword via score_keywords.
+
+        Reuses the same JEL/interest-keyword logic the paper sensors apply
+        rather than a hand-rolled keyword list.
+
+        Args:
+            content_text: Plain-text post content.
+            doi: DOI extracted from the post, or None.
+
+        Returns:
+            True if the post passes the econ gate, False to drop it.
+        """
+        # A DOI is a strong econ-relevance signal on its own.
+        if doi is not None:
+            return True
+
+        # An explicit econ hashtag qualifies the post.
+        lowered = content_text.lower()
+        if any(tag in lowered for tag in _ECON_HASHTAGS):
+            return True
+
+        # Otherwise require a profile interest-keyword match.
+        from econsignals.lib.relevance import score_keywords
+
+        return score_keywords(content_text, "", self._interest_kw) > 0.0
 
     def _parse_post(self, post: dict) -> dict | None:
         """Convert a raw Bluesky post dict to a social_item dict.
@@ -339,6 +385,11 @@ class BlueskySensor(BaseSensor):
             nber_m = _RE_NBER.search(text)
             if nber_m:
                 doi = f"10.3386/{nber_m.group(1).lower()}"
+
+        # Econ-relevance gate: drop posts that match no interest keyword, carry
+        # no DOI, and bear no econ hashtag.
+        if not self._passes_econ_gate(text, doi):
+            return None
 
         paper_id = self._match_paper(doi=doi)
 

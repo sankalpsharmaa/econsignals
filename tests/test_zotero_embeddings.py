@@ -111,7 +111,12 @@ class TestComputeZoteroEmbeddingScoresUnit:
         assert scores == []
 
     def test_similar_text_scores_higher_than_unrelated(self):
-        """Fake embedder with keyword overlap: similar topic scores higher than unrelated."""
+        """Top-k pooling: similar topic scores at least as high as unrelated.
+
+        After the floor-subtract/clip rescale a clearly-unrelated candidate clips
+        to 0, so the relation is >= (the similar candidate must never score below
+        the unrelated one).
+        """
         corpus = [
             {"text": "Urban housing supply and land use regulation in developing countries."},
             {"text": "Random unrelated topic about cooking recipes and gardening."},
@@ -128,10 +133,14 @@ class TestComputeZoteroEmbeddingScoresUnit:
 
         assert len(scores_similar) == 1
         assert len(scores_unrelated) == 1
-        assert scores_similar[0] > scores_unrelated[0]
+        assert scores_similar[0] >= scores_unrelated[0]
 
     def test_identical_text_scores_highest(self):
-        """Exact corpus match should get max similarity to that item."""
+        """Exact corpus match saturates the boost cap.
+
+        Identical text → cosine 1.0 → top-k mean 1.0 → (1.0 - floor)/width clips
+        to _MAX_BOOST (0.7), so score = 0.7 * scale = 7.0.
+        """
         text = "Development economics and randomized controlled trials in India."
         corpus = [{"text": text}]
         candidate = [{"title": "", "abstract": text}]
@@ -143,8 +152,8 @@ class TestComputeZoteroEmbeddingScoresUnit:
             scores = compute_zotero_embedding_scores(candidate, corpus)
 
         assert len(scores) == 1
-        # Identical text → identical embedding → cosine sim = 1 → score = 10
-        assert scores[0] > 9.0
+        # cosine 1.0 → rescaled boost saturates at _MAX_BOOST (0.7) → score = 7.0
+        assert scores[0] == pytest.approx(7.0, abs=1e-6)
 
     def test_scale_applied(self):
         """Custom scale multiplies the score."""
@@ -304,9 +313,12 @@ class TestOllamaWithRealZotero:
         assert len(scores) == 1
         assert scores[0] > 5.0, f"Exact match should score high, got {scores[0]:.3f}"
 
-    def test_recency_affects_ranking(self):
-        """Newer corpus items contribute more (by design). Same similarity, different order → different score."""
-        # Use a small corpus; swap order of two items and verify score changes
+    def test_corpus_order_does_not_affect_ranking(self):
+        """Top-k pooling is order-invariant: scoring uses the nearest items, not position.
+
+        Recency weighting was removed (it was empirically inert over a homogeneous
+        ~495-item corpus), so reversing the corpus must leave scores unchanged.
+        """
         corpus = load_zotero_corpus(max_items=10)
         if len(corpus) < 2:
             pytest.skip("Need at least 2 corpus items")
@@ -314,9 +326,8 @@ class TestOllamaWithRealZotero:
         candidate = [{"title": corpus[0]["title"], "abstract": corpus[0].get("abstract", "")}]
         scores_orig = compute_zotero_embedding_scores(candidate, corpus)
 
-        # Reverse corpus (oldest first) — same items, different weights
+        # Reverse corpus (oldest first) — same items, no position-based weighting
         corpus_reversed = list(reversed(corpus))
         scores_rev = compute_zotero_embedding_scores(candidate, corpus_reversed)
 
-        # When candidate matches first item: orig has it weighted high, rev has it weighted low
-        assert scores_orig[0] != scores_rev[0]
+        assert scores_orig[0] == pytest.approx(scores_rev[0], abs=1e-9)

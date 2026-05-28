@@ -2,7 +2,8 @@
 
 Scores papers on a 0-1 scale using a weighted combination of JEL code match,
 keyword overlap, author proximity, source prestige, recency, and social signal.
-An India boost of +0.15 is applied when the paper has clear India relevance.
+India relevance amplifies the topical-fit score multiplicatively (up to +0.15),
+so a paper that merely names India without field relevance is not promoted.
 """
 
 from __future__ import annotations
@@ -29,13 +30,33 @@ _IDENTITY_PATH: Path = PROJ_ROOT / "profile" / "identity.md"
 # Scoring weights
 # ---------------------------------------------------------------------------
 
-_W_JEL: float = 0.30
-_W_KW: float = 0.20
-_W_AUTHOR: float = 0.25
+# Weights are tuned so topical fit (keywords + JEL) dominates. Author proximity
+# is down-weighted because it is pure noise until the user tracks anyone (every
+# OpenAlex paper carries auto-discovered authors). See score_author_proximity.
+_W_JEL: float = 0.22
+_W_KW: float = 0.33
+_W_AUTHOR: float = 0.08
 _W_PRESTIGE: float = 0.10
-_W_RECENCY: float = 0.10
+_W_RECENCY: float = 0.07
 _W_SOCIAL: float = 0.05
-_INDIA_BOOST: float = 0.15
+
+# India relevance for an India-PRIMARY researcher: a strong additive floor (so a
+# genuine India paper clears generic global work) plus amplification on topical
+# fit. A paper that merely names India without field relevance gets the floor
+# only, not the amplification, so it cannot top a real urban/land/dev paper.
+_INDIA_FLOOR: float = 0.30
+_INDIA_AMP: float = 0.15
+
+# Keyword topics split by how distinctive they are to this researcher. Core
+# (urban/land/India-structural) topics each count as a full match; broad social-
+# science topics (health, education, inequality) that any dev paper hits count
+# partially, so three generic hits no longer saturate the score.
+_CORE_TOPICS: frozenset[str] = frozenset({
+    "urbanization", "housing", "land use", "property rights", "migration",
+    "informal sector", "sanitation", "smart cities mission", "caste",
+    "slum", "land", "tenure", "zoning",
+})
+_SECONDARY_CREDIT: float = 0.25
 
 _RECENCY_PEAK_DAYS: int = 7
 _RECENCY_ZERO_DAYS: int = 90
@@ -99,6 +120,22 @@ _INDIA_PATTERNS: re.Pattern[str] = re.compile(
 
 _jel_weights_cache: dict[str, float] | None = None
 _interest_kw_cache: set[str] | None = None
+_has_tracked_cache: bool | None = None
+
+
+def _has_tracked_authors(db: sqlite3.Connection) -> bool:
+    """Return True if any author is flagged is_tracked (cached per process).
+
+    Author proximity is only a real signal when the user tracks someone. With
+    nobody tracked, auto-discovered co-authorship is noise and must not score.
+    """
+    global _has_tracked_cache
+    if _has_tracked_cache is None:
+        row = db.execute(
+            "SELECT 1 FROM authors WHERE is_tracked = 1 LIMIT 1"
+        ).fetchone()
+        _has_tracked_cache = row is not None
+    return _has_tracked_cache
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +169,22 @@ def load_jel_weights() -> dict[str, float]:
 
 
 def load_interest_keywords() -> set[str]:
-    """Parse profile/identity.md and extract the Topics of Interest keywords.
+    """Parse profile/identity.md and extract Topics of Interest as phrases.
 
-    Reads every bullet line under the "## Topics of Interest" section,
-    splits on commas and whitespace, and lower-cases all tokens.
+    Reads every bullet line under the "## Topics of Interest" section and splits
+    on commas only, preserving multi-word phrases ("property rights", "land use",
+    "smart cities mission"). Splitting on whitespace (the old behaviour) shattered
+    these into generic unigrams ("public", "use", "human") that matched unrelated
+    finance/CS papers; phrase matching keeps the signal precise.
 
     Returns:
-        Set of lowercase keyword strings.
+        Set of lowercase interest phrases.
 
     Example:
         >>> kw = load_interest_keywords()
         >>> "urbanization" in kw
+        True
+        >>> "property rights" in kw
         True
     """
     global _interest_kw_cache
@@ -166,13 +208,13 @@ def load_interest_keywords() -> set[str]:
             # Stop at the next section header
             if stripped.startswith("##"):
                 break
-            # Strip leading bullet markers and parse comma-separated tokens
+            # Strip leading bullet markers and split on commas, keeping phrases
             content = re.sub(r"^[-*]\s*", "", stripped)
             if content:
-                for token in re.split(r"[,\s]+", content):
-                    token = token.strip().lower()
-                    if token:
-                        keywords.add(token)
+                for phrase in content.split(","):
+                    phrase = re.sub(r"\s+", " ", phrase.strip().lower())
+                    if phrase:
+                        keywords.add(phrase)
 
     _interest_kw_cache = keywords
     return keywords
@@ -225,40 +267,43 @@ def score_jel(jel_codes: list[str], weights: dict[str, float]) -> float:
 
 
 def score_keywords(title: str, abstract: str, interest_kw: set[str]) -> float:
-    """Token overlap between paper text and interest keywords.
+    """Phrase-match interest topics against the paper text, weighted by topic.
 
-    Tokenizes the combined title and abstract, then counts how many of the
-    interest keywords appear. Score = matches / len(interest_kw), capped at 1.0.
+    Whole-word matches a distinctive core topic (urban/land/India-structural) as
+    a full point and a broad secondary topic (health, education, inequality) as
+    a fraction, capped at 1.0. This stops a generic global paper that hits three
+    secondary topics from saturating to the same score as a focused urban paper.
 
     Args:
         title: Paper title string (may be None-ish; handled defensively).
         abstract: Paper abstract string.
-        interest_kw: Set of lowercase interest keyword tokens.
+        interest_kw: Set of lowercase interest phrases.
 
     Returns:
         Float in [0, 1]. Returns 0.0 if interest_kw is empty.
 
     Example:
-        >>> score_keywords("Housing in India", "", {"housing", "india"})
+        >>> score_keywords("Housing and land use in slums", "", {"housing", "land use", "slum"})
         1.0
     """
     if not interest_kw:
         return 0.0
 
     combined = f"{title or ''} {abstract or ''}".lower()
-    # Tokenize to words (allow hyphens within words)
-    tokens: set[str] = set(re.findall(r"[a-z][\w-]*", combined))
-
-    matches = len(interest_kw & tokens)
-    return min(1.0, matches / len(interest_kw))
+    total = 0.0
+    for phrase in interest_kw:
+        if re.search(rf"\b{re.escape(phrase)}\b", combined):
+            total += 1.0 if phrase in _CORE_TOPICS else _SECONDARY_CREDIT
+    return min(1.0, total)
 
 
 def score_author_proximity(paper_id: int, db: sqlite3.Connection) -> float:
     """Score based on the most prominent author relationship to the user.
 
-    Priority: tracked (1.0) > auto-discovered (0.7) > unknown (0.0).
-    The co-author-of-tracked tier (0.5) is approximated by checking whether
-    any non-tracked author shares a paper with any tracked author.
+    Priority: tracked (1.0) > co-author-of-tracked (0.5) > auto-discovered (0.3,
+    only when at least one author is tracked) > unknown (0.0). When the user
+    tracks nobody, auto-discovery is meaningless noise and scores 0.0, so this
+    signal stops crediting every OpenAlex paper.
 
     Args:
         paper_id: Primary key of the paper in the DB.
@@ -289,8 +334,8 @@ def score_author_proximity(paper_id: int, db: sqlite3.Connection) -> float:
 
         if is_tracked:
             return 1.0  # Can't do better
-        elif auto_disc:
-            best = max(best, 0.7)
+        elif auto_disc and _has_tracked_authors(db):
+            best = max(best, 0.3)
         else:
             has_unknown = True
 
@@ -425,6 +470,11 @@ def score_recency(published_at: str | None) -> float:
 
     today = datetime.now(timezone.utc)
     age_days = (today - pub_date).days
+    # Future-dated papers are usually a journal's forthcoming-issue stamp, not a
+    # genuine publication date; score them neutral rather than freshest, so junk
+    # with a fabricated future date cannot ride recency to the top.
+    if age_days < 0:
+        return 0.5
 
     if age_days <= _RECENCY_PEAK_DAYS:
         return 1.0
@@ -482,8 +532,9 @@ def score_social(paper_id: int, db: sqlite3.Connection) -> float:
 def india_boost(
     title: str, abstract: str, paper_id: int, db: sqlite3.Connection
 ) -> float:
-    """Return 0.15 if the paper has clear India relevance, else 0.0.
+    """Return 1.0 if the paper has clear India relevance, else 0.0.
 
+    Used as a gate by score_paper, which applies the India floor/amplification.
     Checks the title, abstract, and author affiliations / country codes.
 
     Args:
@@ -493,11 +544,11 @@ def india_boost(
         db: Open sqlite3 connection.
 
     Returns:
-        0.15 or 0.0.
+        1.0 or 0.0.
     """
     combined = f"{title or ''} {abstract or ''}"
     if _INDIA_PATTERNS.search(combined):
-        return _INDIA_BOOST
+        return 1.0
 
     # Check authors
     rows = db.execute(
@@ -515,9 +566,9 @@ def india_boost(
         affiliation: str = row[1] or ""
 
         if country == "IN":
-            return _INDIA_BOOST
+            return 1.0
         if _INDIA_PATTERNS.search(affiliation):
-            return _INDIA_BOOST
+            return 1.0
 
     return 0.0
 
@@ -559,13 +610,15 @@ def score_paper(
         except (json.JSONDecodeError, TypeError):
             jel_codes = []
 
-    s_jel = score_jel(jel_codes, jel_weights)
     s_kw = score_keywords(title, abstract, interest_kw)
+    # JEL is the strongest signal when present, but 96% of papers carry no JEL
+    # codes. Rather than zero out the JEL weight for them, let it ride on the
+    # keyword (topical) evidence so a metadata gap is not a relevance penalty.
+    s_jel = score_jel(jel_codes, jel_weights) if jel_codes else s_kw
     s_author = score_author_proximity(paper_id, db)
     s_prestige = score_source_prestige(paper_id, db)
     s_recency = score_recency(paper.get("published_at"))
     s_social = score_social(paper_id, db)
-    boost = india_boost(title, abstract, paper_id, db)
 
     weighted = (
         _W_JEL * s_jel
@@ -576,7 +629,13 @@ def score_paper(
         + _W_SOCIAL * s_social
     )
 
-    return min(1.0, weighted + boost)
+    # India relevance: a strong floor (this researcher is India-primary) plus
+    # amplification on topical fit, so genuine India papers clear generic global
+    # work while a bare India mention without field relevance gets the floor only.
+    if india_boost(title, abstract, paper_id, db):
+        weighted += _INDIA_FLOOR + _INDIA_AMP * max(s_jel, s_kw)
+
+    return min(1.0, weighted)
 
 
 # ---------------------------------------------------------------------------
@@ -689,9 +748,14 @@ def update_jel_weights(paper_id: int, is_interesting: bool) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point: (re)score all papers and print a status line."""
     from econsignals.lib.db import init_db
 
     init_db()
-    count = score_all_papers(days=30)
+    count = score_all_papers(days=3650)
     print(json.dumps({"status": "ok", "scored": count}))
+
+
+if __name__ == "__main__":
+    main()

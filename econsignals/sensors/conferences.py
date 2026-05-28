@@ -179,9 +179,12 @@ def _parse_date_string(raw: str) -> Optional[str]:
     raw = raw.strip().rstrip(".,;")
     # Strip trailing range component like "15-17" -> keep first date
     raw = re.sub(r"(\d{1,2})\s*[-–]\s*\d{1,2}(,?\s+\d{4})", r"\1\2", raw)
+    # Try each format against the full cleaned string; the calling regexes
+    # already isolate the date, so no slicing is needed (slicing truncated
+    # long-month strings like "5 September 2026" and dropped valid dates)
     for fmt in _DATE_FORMATS:
         try:
-            return datetime.strptime(raw[: len(fmt) + 6], fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             pass
     return None
@@ -312,21 +315,32 @@ def _fallback_deadline(typical_month: int) -> str:
     return candidate.isoformat()
 
 
-def _fallback_event(typical_month: int, deadline_year: int) -> str:
+def _fallback_event(
+    typical_month: int,
+    deadline_year: int,
+    deadline_month: Optional[int] = None,
+) -> str:
     """Generate a plausible event ISO date from a typical conference month.
+
+    Anchor the event to the deadline year so the synthetic event never lands
+    before its own deadline. When the event month falls earlier in the
+    calendar than the deadline month (e.g. AEA: deadline March, event January),
+    the event belongs to the following year, so roll forward.
 
     Args:
         typical_month: Integer 1-12 representing the expected conference month.
-        deadline_year: Year used for the corresponding deadline (used as anchor).
+        deadline_year: Year of the corresponding deadline (anchor year).
+        deadline_month: Month 1-12 of the corresponding deadline, used to detect
+            an event that precedes its deadline within the same year.
 
     Returns:
         ISO date string for the 1st of the target month and year.
     """
-    today = date.today()
-    year = today.year
+    year = deadline_year
+    # An event earlier in the calendar than its deadline belongs to next year
+    if deadline_month is not None and typical_month < deadline_month:
+        year += 1
     candidate = date(year, typical_month, 1)
-    if candidate < today:
-        candidate = date(year + 1, typical_month, 1)
     return candidate.isoformat()
 
 
@@ -434,9 +448,17 @@ class ConferencesSensor(BaseSensor):
             used_fallback = True
 
         if event_date is None and conf.get("typical_event_month"):
-            # Anchor event year to the deadline year when available
-            dl_year = int(deadline_date[:4]) if deadline_date else date.today().year
-            event_date = _fallback_event(conf["typical_event_month"], dl_year)
+            # Anchor the event year and month to the deadline so the synthetic
+            # event never lands before its own deadline
+            if deadline_date:
+                dl_year = int(deadline_date[:4])
+                dl_month = int(deadline_date[5:7])
+            else:
+                dl_year = date.today().year
+                dl_month = conf.get("typical_deadline_month")
+            event_date = _fallback_event(
+                conf["typical_event_month"], dl_year, dl_month
+            )
 
         # If we have neither a live date nor a typical month, skip
         if deadline_date is None and event_date is None:
@@ -489,7 +511,7 @@ class ConferencesSensor(BaseSensor):
             try:
                 record = self._parse_conference(key, conf)
             except Exception as exc:
-                warnings.warn(f"[conferences] {key}: unexpected error: {exc}")
+                print(f"[conferences] {key}: unexpected error: {exc}", file=sys.stderr)
                 self.stats["errors"] = int(self.stats["errors"]) + 1
                 continue
             if record is not None:

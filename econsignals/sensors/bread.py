@@ -61,19 +61,22 @@ _RE_PDF_LINK = re.compile(
 # WP number from the decoded PDF filename (e.g. "WP 647 - ...")
 _RE_WP_IN_URL = re.compile(r"WP\s*(\d{3,4})", re.IGNORECASE)
 
-# Season + year (e.g. "Fall 2025", "Spring 2025", "Winter 2024")
+# Season + year and month + year. Google Sites splits text across nested
+# spans, so "Spring 2025" can render as "S pring 202 5". _parse_date strips
+# ALL whitespace before matching these, so the patterns carry no inter-token
+# space: the season/month word sits immediately against the 4-digit year.
 _RE_SEASON_YEAR = re.compile(
-    r"\b(Fall|Spring|Summer|Winter|Autumn)\s+(20\d{2}|19\d{2})\b",
+    r"(Fall|Spring|Summer|Winter|Autumn)(20\d{2}|19\d{2})",
     re.IGNORECASE,
 )
 _RE_MONTH_YEAR = re.compile(
-    r"\b(January|February|March|April|May|June|July|August|September|"
+    r"(January|February|March|April|May|June|July|August|September|"
     r"October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-    r"[\s,]+(20\d{2}|19\d{2})\b",
+    r"(20\d{2}|19\d{2})",
     re.IGNORECASE,
 )
 _RE_ISO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
-_RE_YEAR_ONLY = re.compile(r"\b(20\d{2}|19\d{2})\b")
+_RE_YEAR_ONLY = re.compile(r"(20\d{2}|19\d{2})")
 
 _SEASON_MONTH: dict[str, int] = {
     "spring": 3,
@@ -97,12 +100,15 @@ _MONTH_MAP: dict[str, int] = {
     "december": 12, "dec": 12,
 }
 
-# Field labels inside the metadata block that follows each PDF link
+# Field labels inside the metadata block that follows each PDF link.
+# Google Sites span-splitting renders "WP#" as "W P#"/"WP #" and adds spaces
+# before colons, so the lookahead boundaries must tolerate interior spaces or
+# Date over-captures the WP#/Authors fields (e.g. "Fall 2023 WP # : 623").
 _RE_DATE_FIELD = re.compile(
-    r"Date\s*:\s*(.+?)(?=WP#|Authors?:|Abstract:|$)",
+    r"Date\s*:\s*(.+?)(?=W\s*P\s*#|Authors?\s*:|Abstract\s*:|$)",
     re.IGNORECASE | re.DOTALL,
 )
-_RE_WP_FIELD = re.compile(r"WP\s*#?\s*[:\s]\s*(\d{3,4})", re.IGNORECASE)
+_RE_WP_FIELD = re.compile(r"W\s*P\s*#?\s*[:\s]\s*(\d{3,4})", re.IGNORECASE)
 _RE_AUTHORS_FIELD = re.compile(
     r"Authors?\s*:\s*(.+?)(?=Abstract\s*:|$)",
     re.IGNORECASE | re.DOTALL,
@@ -157,25 +163,30 @@ def _parse_date(raw: str | None) -> str | None:
         return None
     raw = raw.strip()
 
+    # match ISO on the original (it carries its own hyphen separators)
     m = _RE_ISO_DATE.search(raw)
     if m:
         return m.group(1)
 
-    m2 = _RE_MONTH_YEAR.search(raw)
+    # collapse Google-Sites span-split whitespace ("S pring 202 5" -> "Spring2025")
+    # so the no-space month/season/year regexes match either form
+    compact = re.sub(r"\s+", "", raw)
+
+    m2 = _RE_MONTH_YEAR.search(compact)
     if m2:
         month = _MONTH_MAP.get(m2.group(1).lower())
         year = int(m2.group(2))
         if month and 1900 <= year <= 2100:
             return f"{year:04d}-{month:02d}-01"
 
-    m3 = _RE_SEASON_YEAR.search(raw)
+    m3 = _RE_SEASON_YEAR.search(compact)
     if m3:
         month = _SEASON_MONTH.get(m3.group(1).lower(), 1)
         year = int(m3.group(2))
         if 1900 <= year <= 2100:
             return f"{year:04d}-{month:02d}-01"
 
-    m4 = _RE_YEAR_ONLY.search(raw)
+    m4 = _RE_YEAR_ONLY.search(compact)
     if m4:
         year = int(m4.group(1))
         if 1990 <= year <= 2100:

@@ -54,6 +54,33 @@ _FUNDING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Exa fills the `highlights` field of a tweet with an AI description of the
+# tweet's attached image or linked page (e.g. "The image prominently displays
+# the Artha journal cover..."), never the actual post. Drop any content that
+# is clearly such a caption rather than a real post.
+_IMAGE_CAPTION_RE = re.compile(
+    r"^\s*(the|this)\s+(image|photo|photograph|graphic|picture|illustration|"
+    r"screenshot|infographic|chart|figure|visual)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_image_caption(text: str) -> bool:
+    """True if `text` reads like an Exa AI image/page caption, not a real post.
+
+    Heuristics: starts with an image-description phrase, or carries neither a
+    URL nor an @handle (real posts almost always include one or the other).
+    """
+    if not text:
+        return True
+    if _IMAGE_CAPTION_RE.match(text):
+        return True
+    # A genuine post usually contains a link or an @mention; a bare prose
+    # description of an image typically has neither.
+    has_url = "http" in text
+    has_handle = bool(re.search(r"@\w", text))
+    return not (has_url or has_handle)
+
 _MONTH_MAP = {
     "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
     "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
@@ -105,6 +132,21 @@ _RE_DOI = re.compile(
     r"(?:https?://(?:dx\.)?doi\.org/|doi:\s*)(10\.\d{4,9}/[^\s\"'<>]+)",
     re.IGNORECASE,
 )
+
+
+# Trailing site-name chrome that Exa returns from a page's HTML <title>,
+# e.g. "Minimum Wages and Rise of the Robots | NBER" or "... - HAL-SHS".
+_TITLE_CHROME_RE = re.compile(r"\s*[|–—-]\s*[^|–—-]{1,60}$")
+
+
+def _strip_title_chrome(title: str) -> str:
+    """Remove a trailing ' | Site' or ' - Site' chrome segment from a title."""
+    if not title:
+        return ""
+    stripped = _TITLE_CHROME_RE.sub("", title).strip()
+    # Only accept the strip if it leaves a substantive title behind; otherwise
+    # the separator was part of the real title, so keep the original.
+    return stripped if len(stripped) >= 15 else title
 
 
 def _strip_html(html: str) -> str:
@@ -192,18 +234,29 @@ class TwitterBridgeSensor(BaseSensor):
                     continue
                 seen.add(source_id)
 
+                # Prefer the real post body; the AI-generated highlight is only
+                # a fallback summary, never the stored content.
+                text = (r.get("text") or "").strip()
                 highlights = r.get("highlights") or []
                 hl_text = " ".join(highlights) if isinstance(highlights, list) else ""
-                content = (hl_text or r.get("text") or r.get("title") or "").strip()
+                content = (text or hl_text).strip()
                 if not content:
                     continue
 
-                author = r.get("author") or ""
+                # Drop items whose only content is an Exa image/page caption
+                # rather than an actual tweet.
+                if not text and _is_image_caption(hl_text):
+                    continue
+                if text and _is_image_caption(text) and not hl_text.strip():
+                    continue
+
+                # Resolve the handle from Exa's author field or the URL, then
+                # normalize to exactly one leading '@' (avoids '@@handle').
+                author = (r.get("author") or "").strip()
                 if not author:
                     m = re.search(r"(?:twitter\.com|x\.com)/([^/]+)", url)
-                    author = f"@{m.group(1)}" if m else "unknown"
-                elif not author.startswith("@"):
-                    author = f"@{author}"
+                    author = m.group(1) if m else "unknown"
+                author = "@" + author.lstrip("@")
 
                 items.append({
                     "source": "twitter",
@@ -269,7 +322,7 @@ class TwitterBridgeSensor(BaseSensor):
                 )
 
                 items.append({
-                    "source": "twitter",
+                    "source": "rss",
                     "source_id": source_id,
                     "author_handle": feed_name,
                     "content": content,
@@ -340,20 +393,28 @@ class TwitterBridgeSensor(BaseSensor):
                 continue
 
             r = results[0]
-            title = (r.get("title") or "").strip()
-            if not title or len(title) < 10:
-                continue
-
-            title_norm = normalize_title(title)
-            if title_norm in seen_titles:
-                continue
-            seen_titles.add(title_norm)
-
             url = (r.get("url") or "").strip()
+            highlights = r.get("highlights") or []
+            text = (r.get("text") or "").strip() or (
+                " ".join(highlights) if isinstance(highlights, list) and highlights else ""
+            ).strip()
+
+            # Strip web-page chrome (e.g. " | NBER", " - HAL-SHS") that Exa
+            # returns verbatim from the HTML <title>, then require either a real
+            # DOI or a substantive de-chromed title before ingesting.
+            title = _strip_title_chrome((r.get("title") or "").strip())
+            doi = self._extract_doi(url) or self._extract_doi(text)
+            if not doi and (not title or len(title) < 15):
+                continue
+
+            title_norm = normalize_title(title) if title else ""
+            dedup_key = doi or title_norm
+            if dedup_key in seen_titles:
+                continue
+            seen_titles.add(dedup_key)
+
             author_raw = (r.get("author") or "").strip()
             pub_date = (r.get("publishedDate") or "")[:10] or None
-            highlights = r.get("highlights") or []
-            text = (" ".join(highlights) if isinstance(highlights, list) and highlights else r.get("text") or "").strip()
 
             authors = [a.strip() for a in re.split(r",\s*|\band\b", author_raw) if a.strip()] if author_raw else []
 
@@ -362,7 +423,7 @@ class TwitterBridgeSensor(BaseSensor):
                 "title": title,
                 "title_normalized": title_norm,
                 "abstract": text[:1000] if text else None,
-                "doi": None,
+                "doi": doi,
                 "url": url,
                 "published_at": pub_date,
                 "paper_type": "working_paper",
@@ -411,13 +472,24 @@ class TwitterBridgeSensor(BaseSensor):
             print(f"[twitter_bridge] funding query={query!r}: {len(results)} results", file=sys.stderr)
 
             for r in results:
+                # Prefer the real post body; fall back to the highlight only.
+                text = (r.get("text") or "").strip()
                 highlights = r.get("highlights") or []
-                content = (" ".join(highlights) if isinstance(highlights, list) and highlights else r.get("text") or r.get("title") or "").strip()
+                hl_text = " ".join(highlights) if isinstance(highlights, list) and highlights else ""
+                content = (text or hl_text).strip()
                 if not content or not _FUNDING_RE.search(content):
                     continue
 
+                # Skip Exa image/page captions masquerading as posts.
+                if not text and _is_image_caption(hl_text):
+                    continue
+
+                # A curated deadline must carry a real date; tweets with no
+                # parseable deadline are not written to the deadlines table.
                 url = (r.get("url") or "").strip()
                 deadline_date = _extract_deadline_date(content)
+                if not deadline_date:
+                    continue
                 name = content[:120].replace("\n", " ").strip()
                 if len(name) > 100:
                     name = name[:100] + "..."

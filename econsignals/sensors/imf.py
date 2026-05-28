@@ -1,19 +1,18 @@
 """IMF working paper sensor for EconSignals.
 
-Collects recent IMF working papers via the IMF eLibrary search API and,
-when that is unavailable or empty, via HTML scraping of the IMF Publications
-page, with an Exa search fallback as a final best-effort source.
+Collects recent IMF working papers via Exa search, restricted to the imf.org
+domain. Earlier eLibrary-API and HTML-scrape tiers were removed: the eLibrary
+endpoint 403s behind CloudFront and the Publications listing is a JS SPA that
+serves no paper links in its raw HTML, so neither tier ever produced a record.
 
-Primary approach: IMF eLibrary REST API at
-    https://www.elibrary.imf.org/search?q=&content=title&start=0&rows=25
-    &sortField=relevance&sortOrder=desc
+Source: Exa search (https://api.exa.ai/search) filtered to include_domains
+    ['imf.org'], category 'research paper'. Requires EXA_API_KEY.
 
-Fallback: HTML scraping of
-    https://www.imf.org/en/Publications/WP
-
-State is stored under the "imf" key in watches/papers/state.json, recording
-the last successfully fetched date so old papers are not re-ingested on every
-run.
+State is stored under the "imf" key in watches/papers/state.json, recording the
+last successful fetch date. The date is used only to bound the Exa query
+loosely; client-side date dropping is intentionally avoided so that papers
+newly discovered but bearing an older publication date are still ingested.
+Deduplication (lib/dedup) suppresses already-seen papers.
 
 Usage:
     python sensors/imf.py
@@ -28,11 +27,9 @@ import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
-from html import unescape
-from urllib.parse import urlencode
 
 # ---------------------------------------------------------------------------
-# Path bootstrap (mirrors _base.py convention)
+# Package imports
 # ---------------------------------------------------------------------------
 
 from econsignals.sensors._base import BaseSensor, PROJ_ROOT
@@ -42,17 +39,11 @@ from econsignals.sensors._exa import exa_search
 # Constants
 # ---------------------------------------------------------------------------
 
-_ELIBRARY_API = "https://www.elibrary.imf.org/search"
-_WP_LISTING_URL = "https://www.imf.org/en/Publications/WP"
-_WP_BASE_URL = "https://www.imf.org"
-
-_ROWS_PER_PAGE = 25
-_MAX_PAGES = 4
 _DEFAULT_LOOKBACK_DAYS = 14
 
 _STATE_PATH = PROJ_ROOT / "watches" / "papers" / "state.json"
 
-# Regex helpers
+# Regex helpers for date parsing
 _RE_ISO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _RE_MONTH_YEAR = re.compile(
     r"\b(January|February|March|April|May|June|July|August|September|"
@@ -67,11 +58,18 @@ _MONTH_MAP: dict[str, int] = {
     "september": 9, "sep": 9, "october": 10, "oct": 10,
     "november": 11, "nov": 11, "december": 12, "dec": 12,
 }
-_RE_JEL_LABEL = re.compile(
-    r"\bJEL[:\s]+([A-Z][0-9]{1,2}(?:[,;\s]+[A-Z][0-9]{1,2})*)", re.IGNORECASE
+
+# A real IMF working paper exposes its WP number in one of three forms:
+# a dated detail URL, a "wpiea<year><num>" PDF slug, or a "WP/NN/NNN" title tag.
+_RE_DATED_WP_URL = re.compile(r"/issues/\d{4}/\d{2}/\d{2}/")
+_RE_WPIEA_SLUG = re.compile(r"wpiea\d+")
+_RE_WP_NUMBER = re.compile(r"\bwp/\d{1,2}/\d{1,4}\b")
+
+# Trailing display cruft on some Exa titles, e.g. ", WP/25/231, November 2025".
+_RE_TITLE_CRUFT = re.compile(
+    r",\s*WP/\d{1,2}/\d{1,4}\s*,\s*[A-Za-z]+\s+\d{4}\s*$",
+    re.IGNORECASE,
 )
-_RE_JEL_CODE = re.compile(r"[A-Z][0-9]{1,2}")
-_RE_WP_HREF = re.compile(r"/en/Publications/WP/Issues/\d{4}/\d{2}/\d{2}/[^\"'\s>]+")
 
 
 # ---------------------------------------------------------------------------
@@ -118,32 +116,6 @@ def _save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _strip_html(html: str) -> str:
-    """Remove HTML tags, unescape entities, and collapse whitespace.
-
-    Args:
-        html: Raw HTML fragment.
-
-    Returns:
-        Plain-text string.
-
-    Examples:
-        >>> _strip_html("<p>Hello &amp; world</p>")
-        'Hello & world'
-    """
-    if not html:
-        return ""
-    html = re.sub(
-        r"<(script|style)[^>]*>.*?</(script|style)>",
-        " ",
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _parse_date(raw: str | None) -> str | None:
     """Normalise a raw date string to ISO YYYY-MM-DD.
 
@@ -173,25 +145,6 @@ def _parse_date(raw: str | None) -> str | None:
     return None
 
 
-def _extract_jel_codes(text: str) -> list[str]:
-    """Extract JEL classification codes from a text block.
-
-    Args:
-        text: Plain text or raw HTML.
-
-    Returns:
-        Deduplicated list of JEL code strings.
-    """
-    codes: list[str] = []
-    seen: set[str] = set()
-    for m in _RE_JEL_LABEL.finditer(text):
-        for code in _RE_JEL_CODE.findall(m.group(1)):
-            if code not in seen:
-                seen.add(code)
-                codes.append(code)
-    return codes
-
-
 def _url_hash(url: str) -> str:
     """Return an 8-character hex digest of a URL for use as a fallback ID.
 
@@ -204,237 +157,56 @@ def _url_hash(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:8]
 
 
-# ---------------------------------------------------------------------------
-# eLibrary API parsing
-# ---------------------------------------------------------------------------
+def _clean_title(title: str) -> str:
+    """Strip trailing display cruft from an Exa-supplied title.
 
-
-def _parse_elibrary_record(rec: dict) -> dict | None:
-    """Convert a raw IMF eLibrary API record to the standard paper dict.
-
-    Returns None if the record lacks a title.
+    Removes the ", WP/NN/NNN, Month YYYY" suffix that Exa sometimes appends.
+    Called only after a record has passed the quality gate, so the stripped
+    WP number is not needed as a signal at this point.
 
     Args:
-        rec: Raw dict from the eLibrary search API ``results`` list.
+        title: Raw title string.
 
     Returns:
-        Standard paper dict for BaseSensor.collect(), or None.
+        Cleaned title string.
     """
-    title = (
-        rec.get("title") or rec.get("name") or rec.get("displayTitle") or ""
-    ).strip()
-    if not title:
-        return None
+    return _RE_TITLE_CRUFT.sub("", title).strip()
 
-    # source_id: prefer WP number, fall back to URL hash
-    wp_number = (
-        rec.get("seriesNumber")
-        or rec.get("wpNumber")
-        or rec.get("reportNumber")
-        or ""
-    ).strip()
-    source_url_raw = (rec.get("url") or rec.get("link") or "").strip()
-    if wp_number:
-        source_id = f"imf-wp-{wp_number}"
-    elif source_url_raw:
-        source_id = _url_hash(source_url_raw)
-    else:
-        source_id = _url_hash(title)
 
-    # Authors
-    raw_authors = rec.get("authors") or rec.get("author") or []
-    authors: list[str] = []
-    if isinstance(raw_authors, list):
-        for a in raw_authors:
-            if isinstance(a, str):
-                name = a.strip()
-            elif isinstance(a, dict):
-                name = (
-                    a.get("name") or a.get("display_name") or a.get("fullName") or ""
-                ).strip()
-            else:
-                name = ""
-            if name:
-                authors.append(name)
-    elif isinstance(raw_authors, str) and raw_authors.strip():
-        authors = [n.strip() for n in re.split(r"[;,]", raw_authors) if n.strip()]
+def _accept_exa_paper(parsed: dict) -> bool:
+    """Decide whether a parsed Exa record is a genuine IMF working paper.
 
-    # Abstract
-    abstract_raw = (
-        rec.get("abstract") or rec.get("description") or rec.get("summary") or ""
+    Quality gate (audit issues 4): reject the "IMF Working Papers" section-page
+    heading and any too-short title, then require either a recognisable WP
+    number (dated detail URL, wpiea PDF slug, or WP/NN/NNN title tag) or some
+    real content (authors or abstract). Reads no date field, so a paper newly
+    discovered but bearing an older publication date is still accepted.
+
+    Args:
+        parsed: Standard paper dict from _parse_exa_record.
+
+    Returns:
+        True if the record should be ingested, False otherwise.
+    """
+    title = (parsed.get("title") or "").strip()
+
+    # Reject the IMF WP landing/section page and degenerate stub titles.
+    if title.lower() == "imf working papers" or len(title) < 20:
+        return False
+
+    # Look for a WP number in the URL or the raw title (case-insensitive).
+    url = (parsed.get("url") or "").lower()
+    title_low = title.lower()
+    has_wp_number = bool(
+        _RE_DATED_WP_URL.search(url)
+        or _RE_WPIEA_SLUG.search(url)
+        or _RE_WP_NUMBER.search(title_low)
     )
-    abstract = _strip_html(abstract_raw).strip() or None
 
-    # Date
-    date_raw = (
-        rec.get("pubDate")
-        or rec.get("publishedDate")
-        or rec.get("publicationDate")
-        or rec.get("date")
-        or ""
-    )
-    published_at = _parse_date(date_raw)
+    # Secondary floor: a real paper usually carries authors or an abstract.
+    has_content = bool(parsed.get("authors") or parsed.get("abstract"))
 
-    # JEL codes
-    jel_codes: list[str] = []
-    jel_raw = rec.get("jel") or rec.get("jelCodes") or []
-    if isinstance(jel_raw, list):
-        for code in jel_raw:
-            if isinstance(code, str):
-                jel_codes.append(code.strip())
-    elif isinstance(jel_raw, str) and jel_raw:
-        jel_codes = [c.strip() for c in re.split(r"[,;\s]+", jel_raw) if c.strip()]
-    if not jel_codes and abstract_raw:
-        jel_codes = _extract_jel_codes(abstract_raw)
-
-    # Keywords
-    kw_raw = rec.get("keywords") or rec.get("topics") or []
-    keywords: list[str] = []
-    if isinstance(kw_raw, list):
-        for k in kw_raw:
-            if isinstance(k, str) and k.strip():
-                keywords.append(k.strip())
-            elif isinstance(k, dict):
-                kw = (k.get("name") or k.get("label") or "").strip()
-                if kw:
-                    keywords.append(kw)
-    elif isinstance(kw_raw, str) and kw_raw:
-        keywords = [k.strip() for k in kw_raw.split(",") if k.strip()]
-
-    source_url = source_url_raw or None
-
-    return {
-        "title": title,
-        "authors": authors,
-        "abstract": abstract,
-        "doi": rec.get("doi") or None,
-        "url": source_url,
-        "published_at": published_at,
-        "paper_type": "working_paper",
-        "jel_codes": jel_codes,
-        "keywords": keywords,
-        "source_id": source_id,
-        "source_url": source_url,
-        "raw_metadata": rec,
-    }
-
-
-# ---------------------------------------------------------------------------
-# HTML scraping fallback helpers
-# ---------------------------------------------------------------------------
-
-
-def _parse_listing_html(html: str) -> list[dict]:
-    """Extract paper stubs from the IMF WP listing page HTML.
-
-    Looks for hrefs matching the IMF working paper URL pattern and extracts
-    whatever title/author text surrounds the link.
-
-    Args:
-        html: Raw HTML of the WP listing page.
-
-    Returns:
-        List of minimal dicts with: url, title, authors_raw.
-    """
-    stubs: list[dict] = []
-    seen_urls: set[str] = set()
-
-    # Each result block: find <a href="/en/Publications/WP/Issues/...">
-    # Pull the link text as title; look for a sibling author text nearby.
-    blocks = re.split(r"(?=<a\s[^>]*href=[\"']/en/Publications/WP/Issues/)", html)
-
-    for block in blocks:
-        m_href = re.match(
-            r'<a\s[^>]*href=["\'](/en/Publications/WP/Issues/[^"\'>\s]+)["\']',
-            block,
-        )
-        if not m_href:
-            continue
-
-        relative_url = m_href.group(1)
-        full_url = _WP_BASE_URL + relative_url
-
-        if full_url in seen_urls:
-            continue
-        seen_urls.add(full_url)
-
-        # Title: text immediately inside the anchor tag (up to ~300 chars)
-        title_match = re.search(
-            r'<a\s[^>]*href=["\'][^"\']+["\'][^>]*>(.*?)</a>', block, re.DOTALL
-        )
-        if title_match:
-            title = _strip_html(title_match.group(1)).strip()
-        else:
-            title = ""
-
-        # Authors: heuristically look in the next ~400 chars after the anchor
-        tail = block[:400]
-        author_match = re.search(
-            r'(?:author|by)[:\s]*([A-Z][a-zA-Z\s,\.]+(?:and\s+[A-Z][a-zA-Z\s,\.]+)*)',
-            tail,
-            re.IGNORECASE,
-        )
-        authors_raw = author_match.group(1).strip() if author_match else ""
-
-        # Date from URL: /Issues/YYYY/MM/DD/
-        date_match = re.search(r"/Issues/(\d{4})/(\d{2})/(\d{2})/", relative_url)
-        date_raw = (
-            f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-            if date_match else ""
-        )
-
-        stubs.append({
-            "url": full_url,
-            "title": title,
-            "authors_raw": authors_raw,
-            "date_raw": date_raw,
-        })
-
-    return stubs
-
-
-def _stub_to_paper(stub: dict) -> dict | None:
-    """Convert a listing stub to a standard paper dict.
-
-    Returns None if the stub has no title.
-
-    Args:
-        stub: Dict from _parse_listing_html.
-
-    Returns:
-        Standard paper dict, or None.
-    """
-    title = stub.get("title", "").strip()
-    if not title:
-        return None
-
-    url = stub.get("url", "")
-    source_id = _url_hash(url) if url else _url_hash(title)
-    authors_raw = stub.get("authors_raw", "")
-    authors: list[str] = []
-    if authors_raw:
-        authors = [
-            p.strip()
-            for p in re.split(r"[,;]|\band\b", authors_raw, flags=re.IGNORECASE)
-            if p.strip() and 2 < len(p.strip()) < 100
-        ]
-
-    published_at = _parse_date(stub.get("date_raw", ""))
-
-    return {
-        "title": title,
-        "authors": authors,
-        "abstract": None,
-        "doi": None,
-        "url": url or None,
-        "published_at": published_at,
-        "paper_type": "working_paper",
-        "jel_codes": [],
-        "keywords": [],
-        "source_id": source_id,
-        "source_url": url or None,
-        "raw_metadata": {"source": "imf_html_scrape", **stub},
-    }
+    return has_wp_number or has_content
 
 
 def _parse_exa_record(rec: dict) -> dict | None:
@@ -518,14 +290,16 @@ def _parse_exa_record(rec: dict) -> dict | None:
 
 
 class IMFSensor(BaseSensor):
-    """Fetch recent IMF working papers from the eLibrary API or HTML scraping.
+    """Fetch recent IMF working papers via Exa search.
 
-    Primary approach uses the IMF eLibrary search API, which returns JSON
-    results. Falls back to HTML scraping of the IMF Publications WP listing
-    if the API is unavailable or returns no usable results.
+    Queries Exa for IMF working papers restricted to the imf.org domain, then
+    applies a quality gate that rejects the "IMF Working Papers" section page
+    and keeps records carrying a WP number or real authors/abstract. No
+    client-side publication-date filter is applied; dedup suppresses repeats.
 
     All parsing is defensive: any parse error results in that item being
-    skipped and logged. A network-wide failure returns an empty list.
+    skipped and logged. A missing EXA_API_KEY or network failure returns an
+    empty list.
 
     Attributes:
         name: Sensor identifier used for DB logging.
@@ -537,18 +311,17 @@ class IMFSensor(BaseSensor):
     watch = "papers"
     rate_limit = 0.5
 
-    ELIBRARY_API = _ELIBRARY_API
-    WP_LISTING_URL = _WP_LISTING_URL
-
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
 
     def _from_date(self) -> str:
-        """Return the ISO date to use as a lower-bound publication filter.
+        """Return the ISO date used to phrase the Exa query loosely.
 
         Reads imf.last_fetched from watches/papers/state.json. Falls back to
-        _DEFAULT_LOOKBACK_DAYS days ago on first run.
+        _DEFAULT_LOOKBACK_DAYS days ago on first run. This date is only woven
+        into the natural-language query text; it is never used as a hard
+        client-side filter, so older-dated but newly-discovered papers survive.
 
         Returns:
             Date string in 'YYYY-MM-DD' format.
@@ -577,185 +350,41 @@ class IMFSensor(BaseSensor):
             print(f"[imf] failed to save state: {exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
-    # eLibrary API approach
+    # Exa collection
     # ------------------------------------------------------------------
-
-    def _build_api_url(self, start: int) -> str:
-        """Construct a paginated eLibrary search URL for IMF working papers.
-
-        Args:
-            start: Zero-based result offset.
-
-        Returns:
-            Fully-qualified URL string.
-        """
-        params: dict[str, str | int] = {
-            "q": "",
-            "content": "title",
-            "start": start,
-            "rows": _ROWS_PER_PAGE,
-            "sortField": "score",
-            "sortOrder": "desc",
-            "fl_type": "Working Paper",
-        }
-        return f"{_ELIBRARY_API}?{urlencode(params)}"
-
-    def _collect_via_api(self, from_date: str) -> list[dict] | None:
-        """Fetch IMF working papers using the eLibrary search API.
-
-        Paginates up to _MAX_PAGES pages. Stops when all papers on a page
-        predate from_date or when fewer results than expected are returned.
-
-        Args:
-            from_date: Lower bound date string 'YYYY-MM-DD'.
-
-        Returns:
-            List of parsed paper dicts, or None if the API appears broken.
-        """
-        papers: list[dict] = []
-        seen_ids: set[str] = set()
-
-        for page in range(_MAX_PAGES):
-            start = page * _ROWS_PER_PAGE
-            url = self._build_api_url(start)
-
-            try:
-                data = self.fetch_json(url)
-            except Exception as exc:
-                print(f"[imf] API page {page + 1} failed: {exc}", file=sys.stderr)
-                if page == 0:
-                    return None
-                break
-
-            if not isinstance(data, dict):
-                print(
-                    f"[imf] API page {page + 1}: unexpected type {type(data).__name__}",
-                    file=sys.stderr,
-                )
-                if page == 0:
-                    return None
-                break
-
-            # eLibrary may nest results under various keys
-            records = (
-                data.get("response", {}).get("docs")
-                or data.get("results")
-                or data.get("docs")
-                or data.get("items")
-                or []
-            )
-            if not isinstance(records, list) or not records:
-                if page == 0:
-                    return None
-                break
-
-            page_papers: list[dict] = []
-            all_old = True
-
-            for rec in records:
-                if not isinstance(rec, dict):
-                    continue
-                try:
-                    parsed = _parse_elibrary_record(rec)
-                except Exception as exc:
-                    print(f"[imf] parse error: {exc}", file=sys.stderr)
-                    continue
-
-                if not parsed:
-                    continue
-
-                sid = parsed["source_id"]
-                if sid in seen_ids:
-                    continue
-                seen_ids.add(sid)
-
-                pub = parsed.get("published_at") or ""
-                if pub and pub < from_date:
-                    continue
-
-                all_old = False
-                page_papers.append(parsed)
-
-            papers.extend(page_papers)
-            print(
-                f"[imf] API page {page + 1}: {len(records)} records, "
-                f"{len(page_papers)} within date window",
-                file=sys.stderr,
-            )
-
-            if len(records) < _ROWS_PER_PAGE:
-                break
-            if all_old and page_papers == [] and records:
-                break
-
-        return papers
-
-    # ------------------------------------------------------------------
-    # HTML scraping fallback
-    # ------------------------------------------------------------------
-
-    def _collect_via_scrape(self, from_date: str) -> list[dict]:
-        """Scrape the IMF WP HTML listing as a fallback.
-
-        Args:
-            from_date: Lower bound date string 'YYYY-MM-DD'.
-
-        Returns:
-            List of parsed paper dicts. Empty list on any error.
-        """
-        print(f"[imf] scraping listing: {_WP_LISTING_URL}", file=sys.stderr)
-        try:
-            raw = self.fetch_url(_WP_LISTING_URL)
-            html = raw.decode("utf-8", errors="replace")
-        except Exception as exc:
-            print(f"[imf] failed to fetch listing page: {exc}", file=sys.stderr)
-            return []
-
-        stubs = _parse_listing_html(html)
-        if not stubs:
-            print("[imf] scraping: no paper links found on listing page", file=sys.stderr)
-            return []
-
-        papers: list[dict] = []
-        for stub in stubs:
-            # Date filter
-            date_raw = stub.get("date_raw", "")
-            if date_raw and date_raw < from_date:
-                continue
-
-            parsed = _stub_to_paper(stub)
-            if parsed:
-                papers.append(parsed)
-
-        print(f"[imf] scraping: collected {len(papers)} papers", file=sys.stderr)
-        return papers
 
     def _collect_via_exa(self, from_date: str) -> list[dict]:
-        """Best-effort Exa fallback when IMF API + HTML produce nothing.
+        """Fetch IMF working papers via Exa, restricted to imf.org.
 
         Args:
-            from_date: Lower bound date string 'YYYY-MM-DD'.
+            from_date: Lower-bound date string 'YYYY-MM-DD', woven into the
+                query text only (no hard client-side date filter).
 
         Returns:
             List of parsed paper dicts. Empty list on missing key/error/no data.
         """
         query = (
-            "Recent IMF working papers site:imf.org/en/Publications/WP "
-            f"published on or after {from_date}"
+            "Recent IMF working papers published on or after "
+            f"{from_date}"
         )
-        print("[imf] querying Exa fallback for IMF working papers", file=sys.stderr)
+        print("[imf] querying Exa for IMF working papers", file=sys.stderr)
+
+        # include_domains pins results to imf.org; no start_published_date is
+        # passed, since Exa filters on the article's original publication date,
+        # which would drop papers newly discovered but dated before from_date.
         raw_results = exa_search(
             query,
             num_results=25,
             max_characters=1200,
+            include_domains=["imf.org"],
             log_prefix="[imf]",
         )
 
         if not raw_results:
             if not (os.environ.get("EXA_API_KEY") or "").strip():
-                print("[imf] Exa fallback skipped: EXA_API_KEY not set", file=sys.stderr)
+                print("[imf] Exa skipped: EXA_API_KEY not set", file=sys.stderr)
             else:
-                print("[imf] Exa fallback returned no results", file=sys.stderr)
+                print("[imf] Exa returned no results", file=sys.stderr)
             return []
 
         papers: list[dict] = []
@@ -766,18 +395,12 @@ class IMFSensor(BaseSensor):
             if not parsed:
                 continue
 
-            url = (parsed.get("url") or "").lower()
-            title = parsed["title"].lower()
-
-            # Keep IMF working-paper-like hits only.
-            if "imf.org" not in url and "imf" not in title:
-                continue
-            if "/publications/wp/" not in url and "working paper" not in title:
+            # Quality gate: reject section pages and content-less stubs.
+            if not _accept_exa_paper(parsed):
                 continue
 
-            pub = parsed.get("published_at") or ""
-            if pub and pub < from_date:
-                continue
+            # Strip trailing WP-number/date cruft from the display title.
+            parsed["title"] = _clean_title(parsed["title"])
 
             sid = parsed["source_id"]
             if sid in seen_ids:
@@ -786,7 +409,7 @@ class IMFSensor(BaseSensor):
             papers.append(parsed)
 
         print(
-            f"[imf] Exa fallback: {len(raw_results)} raw results, {len(papers)} usable papers",
+            f"[imf] Exa: {len(raw_results)} raw results, {len(papers)} usable papers",
             file=sys.stderr,
         )
         return papers
@@ -796,14 +419,12 @@ class IMFSensor(BaseSensor):
     # ------------------------------------------------------------------
 
     def collect(self) -> list[dict]:
-        """Fetch recent IMF working papers.
+        """Fetch recent IMF working papers via Exa.
 
         Steps:
         1. Determine from_date via watch state (default: 14 days ago).
-        2. Attempt the eLibrary API; parse and filter by date.
-        3. If the API returns nothing usable, fall back to HTML scraping.
-        4. If still empty, try Exa search fallback.
-        5. Update watch state with today's date.
+        2. Query Exa, restricted to imf.org, and apply the quality gate.
+        3. Advance watch state only if papers were collected.
 
         Returns:
             List of paper dicts conforming to BaseSensor.collect() contract.
@@ -811,44 +432,22 @@ class IMFSensor(BaseSensor):
         """
         from_date = self._from_date()
         print(
-            f"[imf] collecting working papers published on or after {from_date}",
+            f"[imf] collecting working papers (from_date hint {from_date})",
             file=sys.stderr,
         )
 
-        papers: list[dict]
-
         try:
-            api_papers = self._collect_via_api(from_date)
+            papers = self._collect_via_exa(from_date)
         except Exception as exc:
-            print(f"[imf] API collection raised unexpectedly: {exc}", file=sys.stderr)
-            api_papers = None
-
-        if api_papers is None:
-            print("[imf] API unavailable, falling back to HTML scraping", file=sys.stderr)
-            try:
-                papers = self._collect_via_scrape(from_date)
-            except Exception as exc:
-                print(f"[imf] HTML scraping also failed: {exc}", file=sys.stderr)
-                papers = []
-        elif not api_papers:
-            print("[imf] API returned no papers, falling back to HTML scraping", file=sys.stderr)
-            try:
-                papers = self._collect_via_scrape(from_date)
-            except Exception as exc:
-                print(f"[imf] HTML scraping failed: {exc}", file=sys.stderr)
-                papers = []
-        else:
-            papers = api_papers
-
-        if not papers:
-            try:
-                papers = self._collect_via_exa(from_date)
-            except Exception as exc:
-                print(f"[imf] Exa fallback failed: {exc}", file=sys.stderr)
-                papers = []
+            print(f"[imf] Exa collection failed: {exc}", file=sys.stderr)
+            papers = []
 
         print(f"[imf] collected {len(papers)} papers", file=sys.stderr)
-        self._update_state()
+
+        # Only advance state on a non-empty collection, so a failed or empty
+        # run does not ratchet the lower bound past an un-captured window.
+        if papers:
+            self._update_state()
         return papers
 
 

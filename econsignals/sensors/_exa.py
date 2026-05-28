@@ -94,10 +94,16 @@ def exa_search(
         "type": "fast",
         "num_results": requested_results,
         "category": category,
+        # Request both the source text and a highlight summary. For tweets the
+        # post body lives in `text`; `highlights` is an AI description of the
+        # attached image/linked page, so callers must prefer `text`.
         "contents": {
+            "text": {
+                "max_characters": requested_chars,
+            },
             "highlights": {
                 "max_characters": requested_chars,
-            }
+            },
         },
     }
 

@@ -7,8 +7,8 @@ Usage:
     python sensors/openalex.py
 
 Environment variables:
-    OPENALEX_EMAIL   Email address for the OpenAlex polite pool (required for
-                     higher rate limits). Falls back to a placeholder if unset.
+    OPENALEX_EMAIL   Email address for the OpenAlex polite pool (higher rate
+                     limits). Falls back to the owner's address if unset.
 """
 
 from __future__ import annotations
@@ -32,17 +32,19 @@ _MAX_PAGES = 3
 _PER_PAGE = 50
 _DEFAULT_LOOKBACK_DAYS = 7
 
-# OpenAlex concept IDs for economics subfields (level 0-1).
-# These map broadly to top-level JEL divisions.
-_CONCEPT_IDS: dict[str, str] = {
-    "economics": "C162324750",
-    "development_economics": "C2522874712",
-    "urban_economics": "C107236723",
-    "labor_economics": "C145236788",
-    "public_economics": "C17744445",
-    "econometrics": "C105795698",
-    "microeconomics": "C50205232",
-}
+# Gate on the work's PRIMARY field, not a low-score peripheral concept tag.
+# fields/20 = "Economics, Econometrics and Finance" in the OpenAlex
+# topics/fields hierarchy. Filtering here drops crypto/coffee/telemedicine/
+# CompSci papers that merely carry a 0.27-score "Economics" concept.
+_PRIMARY_FIELD_ID = "fields/20"
+
+# ISO-2 author countries to scope the feed for an India-focused, South-Asia /
+# developing-country profile. Widen or narrow this single string to retune geo.
+_AUTHOR_COUNTRIES = "IN|BD|PK|LK|NP"
+
+# Polite-pool contact email. OpenAlex routes a valid, monitored address to the
+# faster pool; a placeholder example.com does not reliably qualify.
+_DEFAULT_EMAIL = "sankalp.sharma437@gmail.com"
 
 # Map OpenAlex work type -> internal paper_type
 _TYPE_MAP: dict[str, str] = {
@@ -51,9 +53,6 @@ _TYPE_MAP: dict[str, str] = {
 
 # Watches state file location
 _STATE_PATH = PROJ_ROOT / "watches" / "papers" / "state.json"
-
-# Profile identity file
-_IDENTITY_PATH = PROJ_ROOT / "profile" / "identity.md"
 
 # Repository-style DOI prefixes and hosts that frequently introduce
 # non-economics drift into the feed.
@@ -266,22 +265,6 @@ def _is_repository_noise(parsed: dict) -> bool:
     return False
 
 
-def _get_concept_filter(concept_ids: list[str]) -> str:
-    """Build the OpenAlex concepts.id filter string.
-
-    Args:
-        concept_ids: List of raw OpenAlex concept ID strings
-            (e.g. ['C162324750', 'C50205232']).
-
-    Returns:
-        Filter value string suitable for the OpenAlex ?filter= parameter,
-        using OR-pipe syntax (concepts.id:C1|C2|...).
-    """
-    if not concept_ids:
-        return f"concepts.id:{_CONCEPT_IDS['economics']}"
-    return "concepts.id:" + "|".join(concept_ids)
-
-
 def _load_state() -> dict:
     """Load the watches/papers/state.json file.
 
@@ -317,39 +300,17 @@ def _save_state(state: dict) -> None:
         raise
 
 
-def _load_profile_concept_ids() -> list[str]:
-    """Parse profile/identity.md to extract preferred OpenAlex concept IDs.
+def _resolve_email() -> str:
+    """Return the OpenAlex polite-pool contact email.
 
-    Looks for a section containing concept IDs in the format 'C\\d+' or
-    matching subfield names from _CONCEPT_IDS.  Falls back to all configured
-    concept IDs if parsing fails or the file does not exist.
+    Prefers OPENALEX_EMAIL when set and non-empty, else the owner's address.
+    Used for both the mailto query param and the request User-Agent so the
+    polite pool is honored even when the env var is unset.
 
     Returns:
-        List of OpenAlex concept ID strings.
+        A non-empty contact email string.
     """
-    if not _IDENTITY_PATH.exists():
-        return list(_CONCEPT_IDS.values())
-
-    try:
-        text = _IDENTITY_PATH.read_text()
-    except Exception:
-        return list(_CONCEPT_IDS.values())
-
-    # Attempt to find explicit concept IDs like C162324750 in the text
-    explicit = re.findall(r"\bC\d{5,}\b", text)
-    if explicit:
-        return explicit
-
-    # Fall back: check which subfield names are mentioned and use those
-    found: list[str] = []
-    text_lower = text.lower()
-    for field_key, concept_id in _CONCEPT_IDS.items():
-        # Match on the human-readable key words
-        readable = field_key.replace("_", " ")
-        if readable in text_lower or field_key in text_lower:
-            found.append(concept_id)
-
-    return found if found else list(_CONCEPT_IDS.values())
+    return os.environ.get("OPENALEX_EMAIL") or _DEFAULT_EMAIL
 
 
 # ---------------------------------------------------------------------------
@@ -360,9 +321,10 @@ def _load_profile_concept_ids() -> list[str]:
 class OpenAlexSensor(BaseSensor):
     """Fetch recent economics papers from the OpenAlex API.
 
-    Queries the OpenAlex /works endpoint for papers matching economics concept
-    IDs published since the last successful run (or 7 days ago on first run).
-    Paginates up to 3 pages (150 papers) per execution.
+    Queries the OpenAlex /works endpoint for papers whose PRIMARY field is
+    Economics and whose authors are in South Asia, published since the last
+    successful run (or 7 days ago on first run).  Paginates up to 3 pages
+    (150 papers) per execution.
 
     Attributes:
         name: Sensor identifier, used for DB logging.
@@ -395,21 +357,24 @@ class OpenAlexSensor(BaseSensor):
             "%Y-%m-%d"
         )
 
-    def _build_url(self, from_date: str, concept_ids: list[str], page: int) -> str:
+    def _build_url(self, from_date: str, page: int) -> str:
         """Build the full OpenAlex /works URL for a given page.
+
+        Gates on the work's primary field (Economics) and on South-Asian
+        author countries, so off-field papers carrying a low-score Economics
+        concept tag never enter the candidate set.
 
         Args:
             from_date: Lower bound date string 'YYYY-MM-DD'.
-            concept_ids: List of concept ID strings for the filter.
             page: 1-based page number.
 
         Returns:
             Fully-qualified URL string.
         """
-        email = os.environ.get("OPENALEX_EMAIL", "")
-        concept_filter = _get_concept_filter(concept_ids)
+        # Primary-field + geo gate; always include a real polite-pool address.
         filters = [
-            concept_filter,
+            f"primary_topic.field.id:{_PRIMARY_FIELD_ID}",
+            f"authorships.countries:{_AUTHOR_COUNTRIES}",
             f"from_publication_date:{from_date}",
             "type:article|preprint",
         ]
@@ -420,9 +385,8 @@ class OpenAlexSensor(BaseSensor):
             "sort": "publication_date:desc",
             "per_page": _PER_PAGE,
             "page": page,
+            "mailto": _resolve_email(),
         }
-        if email:
-            params["mailto"] = email
 
         return f"{_OPENALEX_BASE}/works?{urlencode(params)}"
 
@@ -430,24 +394,26 @@ class OpenAlexSensor(BaseSensor):
         """Fetch recent economics papers from OpenAlex.
 
         Steps:
-        1. Load concept IDs from user profile (or fall back to defaults).
-        2. Determine from_date via watch state.
-        3. Paginate /works up to _MAX_PAGES pages.
-        4. Parse each work into the standard paper dict.
-        5. Upsert author records into the DB.
-        6. Update watch state with current timestamp.
+        1. Determine from_date via watch state.
+        2. Paginate /works up to _MAX_PAGES pages.
+        3. Parse each work into the standard paper dict.
+        4. Upsert author records into the DB.
+        5. Update watch state with current timestamp.
 
         Returns:
             List of paper dicts suitable for BaseSensor.run() ingestion.
         """
         from econsignals.lib.normalize import canonical_paper_id
 
-        concept_ids = _load_profile_concept_ids()
         from_date = self._from_date()
+
+        # Override the _base placeholder UA with a real polite-pool address.
+        email = _resolve_email()
+        headers = {"User-Agent": f"EconSignals/1.0 (mailto:{email})"}
 
         print(
             f"[openalex] fetching works from {from_date} "
-            f"with {len(concept_ids)} concept filter(s)",
+            f"(field={_PRIMARY_FIELD_ID}, countries={_AUTHOR_COUNTRIES})",
             file=sys.stderr,
         )
 
@@ -456,9 +422,9 @@ class OpenAlexSensor(BaseSensor):
         skipped_noise = 0
 
         for page in range(1, _MAX_PAGES + 1):
-            url = self._build_url(from_date, concept_ids, page)
+            url = self._build_url(from_date, page)
             try:
-                response = self.fetch_json(url)
+                response = self.fetch_json(url, headers=headers)
             except Exception as exc:
                 print(f"[openalex] page {page} fetch failed: {exc}", file=sys.stderr)
                 break

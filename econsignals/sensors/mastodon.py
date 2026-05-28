@@ -32,6 +32,18 @@ from econsignals.sensors._base import BaseSensor
 
 _TIMELINE_LIMIT = 40
 
+# Known econ-account allowlist: posts from these handles bypass the keyword
+# gate so genuine economists who post from remote instances (which local=true
+# would otherwise drop) are still ingested. Match is case-insensitive on the
+# normalised "@user@instance" handle.
+_ECON_ACCOUNTS: set[str] = {
+    "@econtwitter@econtwitter.net",
+    "@tealtan@econtwitter.net",
+}
+
+# Econ hashtags that, when present, qualify a post regardless of keyword match.
+_ECON_HASHTAGS: tuple[str, ...] = ("#econ", "#economics", "#econsky", "#devecon")
+
 # DOI patterns mirroring the bluesky sensor
 _RE_DOI = re.compile(
     r"(?:https?://(?:dx\.)?doi\.org/|doi:\s*)(10\.\d{4,9}/[^\s\"'<>]+)",
@@ -110,6 +122,17 @@ class MastodonSensor(BaseSensor):
     INSTANCES: list[str] = ["econtwitter.net"]
     HASHTAGS: list[str] = ["econtwitter", "economics", "econsky", "devecon"]
 
+    def __init__(self) -> None:
+        """Initialise the sensor and cache the profile interest keywords.
+
+        load_interest_keywords() self-caches at module level, but caching the
+        set on the instance avoids the repeated import in the per-status gate.
+        """
+        super().__init__()
+        from econsignals.lib.relevance import load_interest_keywords
+
+        self._interest_kw: set[str] = load_interest_keywords()
+
     # ------------------------------------------------------------------
     # API methods
     # ------------------------------------------------------------------
@@ -123,7 +146,12 @@ class MastodonSensor(BaseSensor):
         Returns:
             List of raw status dicts, or empty list on any error.
         """
-        url = f"https://{instance}/api/v1/timelines/public?limit={_TIMELINE_LIMIT}"
+        # local=true restricts to instance-authored posts, dropping the
+        # federated firehose (remote instances that flood 88% noise).
+        url = (
+            f"https://{instance}/api/v1/timelines/public"
+            f"?local=true&limit={_TIMELINE_LIMIT}"
+        )
         try:
             data = self.fetch_json(url)
         except Exception as exc:
@@ -146,9 +174,11 @@ class MastodonSensor(BaseSensor):
         Returns:
             List of raw status dicts, or empty list on any error.
         """
+        # local=true keeps only instance-local authors on the hashtag timeline,
+        # since broad tags (e.g. #economics) are used worldwide by non-academics.
         url = (
             f"https://{instance}/api/v1/timelines/tag/{hashtag}"
-            f"?limit={_TIMELINE_LIMIT}"
+            f"?local=true&limit={_TIMELINE_LIMIT}"
         )
         try:
             data = self.fetch_json(url)
@@ -210,6 +240,47 @@ class MastodonSensor(BaseSensor):
             )
         return None
 
+    def _passes_econ_gate(
+        self, content_text: str, author_handle: str | None, doi: str | None
+    ) -> bool:
+        """Decide whether a post is econ-relevant enough to ingest.
+
+        A post qualifies if ANY of the following holds:
+          - its handle is on the known-econ-account allowlist,
+          - it carries a DOI (paper enrichment, treated as a strong signal),
+          - it contains an econ hashtag (#econ, #economics, #econsky, #devecon),
+          - its text matches a profile interest keyword via score_keywords.
+
+        This refines residual local noise (e.g. econtwitter.net bots posting
+        off-topic content) while reusing the same JEL/interest-keyword logic the
+        paper sensors apply, rather than a hand-rolled keyword list.
+
+        Args:
+            content_text: Plain-text post content.
+            author_handle: Normalised "@user@instance" handle, or None.
+            doi: DOI extracted from the post, or None.
+
+        Returns:
+            True if the post passes the econ gate, False to drop it.
+        """
+        # Allowlisted econ accounts bypass the keyword gate entirely.
+        if author_handle and author_handle.lower() in _ECON_ACCOUNTS:
+            return True
+
+        # A DOI is a strong econ-relevance signal on its own.
+        if doi is not None:
+            return True
+
+        # An explicit econ hashtag qualifies the post.
+        lowered = content_text.lower()
+        if any(tag in lowered for tag in _ECON_HASHTAGS):
+            return True
+
+        # Otherwise require a profile interest-keyword match.
+        from econsignals.lib.relevance import score_keywords
+
+        return score_keywords(content_text, "", self._interest_kw) > 0.0
+
     def _parse_status(self, status: dict) -> dict | None:
         """Convert a raw Mastodon status dict to a social_item dict.
 
@@ -270,6 +341,12 @@ class MastodonSensor(BaseSensor):
         engagement_score = round(math.log1p(favourites + reblogs), 4)
 
         doi = self._extract_doi(content_text)
+
+        # Econ-relevance gate: drop posts that match no interest keyword, carry
+        # no DOI, bear no econ hashtag, and are not from an allowlisted account.
+        if not self._passes_econ_gate(content_text, author_handle, doi):
+            return None
+
         paper_id = self._match_paper(doi)
 
         return {

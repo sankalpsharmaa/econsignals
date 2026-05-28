@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "econsignals"
+version = "1.0.0"
+description = "Personal economics research-intelligence agent: sensors, relevance scoring, daily brief, and a dashboard."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sankalp Sharma" }]
+dependencies = [
+    "certifi>=2023.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+# Local interactive dashboard backend (the public site is static and needs neither).
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.23",
+]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+econsignals-snapshot = "econsignals.lib.snapshot:main"
+econsignals-score = "econsignals.lib.relevance:main"
+econsignals-web = "econsignals.web.app:run"
+
+[tool.setuptools]
+packages = [
+    "econsignals",
+    "econsignals.lib",
+    "econsignals.sensors",
+    "econsignals.lenses",
+    "econsignals.web",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

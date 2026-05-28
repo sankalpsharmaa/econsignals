@@ -265,7 +265,102 @@ def _build_journal_url(issn: str, from_date: str, email: str) -> str:
     return f"{_CROSSREF_BASE}/journals/{issn}/works?{urlencode(params)}"
 
 
-def _parse_work(work: dict) -> dict | None:
+def _is_editorial_junk(title: str) -> bool:
+    """Return True if a title is editorial matter, not a research paper.
+
+    Crossref tags editorial boards, corrections, and front/back matter as
+    type=journal-article with a DOI, so the title+DOI gate alone lets them
+    through.  This filter drops them by normalized exact match plus a prefix
+    regex for the correction/erratum family.
+
+    Args:
+        title: Raw paper title.
+
+    Returns:
+        True if the title should be skipped, False otherwise.
+
+    Examples:
+        >>> _is_editorial_junk("Editorial Board")
+        True
+        >>> _is_editorial_junk("Corrigendum to 'Land titling in India'")
+        True
+        >>> _is_editorial_junk("A Price Index for Rural India")
+        False
+    """
+    normalized = " ".join(title.lower().split())
+    # Exact-match denylist: whole title is the junk phrase
+    _SKIP_EXACT = {
+        "editorial board",
+        "front matter",
+        "back matter",
+        "correction",
+        "corrigendum",
+        "erratum",
+        "index",
+        "issue information",
+        "contents",
+        "table of contents",
+        "reviewer acknowledgement",
+        "reviewer acknowledgment",
+    }
+    if normalized in _SKIP_EXACT:
+        return True
+    # Prefix match: corrections/errata carry a trailing target title
+    return bool(
+        re.match(
+            r"^(correction|corrigendum|erratum|editorial board|front matter|back matter)\b",
+            normalized,
+        )
+    )
+
+
+def _resolve_published_at(work: dict, today_plus_1: str) -> str | None:
+    """Determine a truthful online-availability date for a Crossref work.
+
+    Crossref's 'published-print' and 'issued' are backdated by publishers
+    (Elsevier stamps print issues months ahead, e.g. [[2026, 6]]), so neither
+    is a valid freshness signal.  The real online-availability date lives in
+    'published-online' and 'created'.  Prefer the MINIMUM of those two when
+    present, fall back to 'issued'/'published-print' only when both are
+    absent, then clamp anything beyond today+1 back to 'created'.
+
+    Args:
+        work: Raw Crossref work object.
+        today_plus_1: ISO date string for tomorrow (UTC); the upper bound a
+            stored date may take.
+
+    Returns:
+        ISO date string 'YYYY-MM-DD', or None if no usable date exists.
+    """
+    # Collect the two trustworthy online-availability dates
+    online_dates: list[str] = []
+    for date_field in ("published-online", "created"):
+        date_obj = work.get(date_field) or {}
+        parsed = _parse_date_parts(date_obj.get("date-parts") or [])
+        if parsed:
+            online_dates.append(parsed)
+
+    # Prefer the earliest online date (true first availability)
+    if online_dates:
+        published_at: str | None = min(online_dates)
+    else:
+        # Both online dates absent: fall back to the backdated issue dates
+        published_at = None
+        for date_field in ("issued", "published-print"):
+            date_obj = work.get(date_field) or {}
+            published_at = _parse_date_parts(date_obj.get("date-parts") or [])
+            if published_at:
+                break
+
+    # Never store a future-dated paper: clamp to the 'created' deposit date
+    if published_at and published_at > today_plus_1:
+        created_parts = (work.get("created") or {}).get("date-parts") or []
+        published_at = _parse_date_parts(created_parts) or published_at
+
+    return published_at
+
+
+def _parse_work(work: dict, today_plus_1: str) -> dict | None:
     """Convert a raw Crossref work object to the standard paper dict format.
 
     Handles partial records gracefully: missing abstract, authors, or date
@@ -273,15 +368,21 @@ def _parse_work(work: dict) -> dict | None:
 
     Args:
         work: Raw dict from the Crossref /journals/{issn}/works endpoint.
+        today_plus_1: ISO date string for tomorrow (UTC); used to clamp
+            backdated/future publication dates.
 
     Returns:
         Paper dict compatible with BaseSensor.collect() return contract, or
-        None if the work lacks a usable title or DOI.
+        None if the work lacks a usable title or DOI, or is editorial junk.
     """
     # Title is a list in Crossref
     title_list = work.get("title") or []
     title = title_list[0].strip() if title_list else ""
     if not title:
+        return None
+
+    # Drop editorial boards, corrections, and front/back matter
+    if _is_editorial_junk(title):
         return None
 
     doi = (work.get("DOI") or "").strip()
@@ -294,22 +395,16 @@ def _parse_work(work: dict) -> dict | None:
     # Authors
     authors = _parse_authors(work.get("author") or [])
 
-    # Abstract: strip JATS tags
+    # Abstract: strip JATS tags (often absent for Elsevier/society journals)
     raw_abstract = work.get("abstract") or ""
     abstract = _strip_jats(raw_abstract) or None
 
-    # Published date: prefer published-print, fall back to published-online
-    published_at: str | None = None
-    for date_field in ("published-print", "published-online", "created"):
-        date_obj = work.get(date_field) or {}
-        date_parts = date_obj.get("date-parts") or []
-        published_at = _parse_date_parts(date_parts)
-        if published_at:
-            break
+    # Published date: true online-availability date, clamped to <= today+1
+    published_at = _resolve_published_at(work, today_plus_1)
 
-    # Keywords from subject array
-    keywords: list[str] = [s.strip() for s in (work.get("subject") or []) if s.strip()]
-
+    # JEL codes and keywords: Crossref returns neither (the 'subject' array is
+    # deprecated and null on current works), so leave both empty. Relevance
+    # now rides JEL on keywords; enrichment happens via OpenAlex during dedup.
     return {
         "title": title,
         "authors": authors,
@@ -319,7 +414,7 @@ def _parse_work(work: dict) -> dict | None:
         "published_at": published_at,
         "paper_type": "journal_article",
         "jel_codes": [],
-        "keywords": keywords,
+        "keywords": [],
         "source_id": doi,
         "source_url": url,
         "raw_metadata": work,
@@ -366,7 +461,11 @@ class CrossrefSensor(BaseSensor):
         """
         email = os.environ.get("OPENALEX_EMAIL", "")
         state = _load_state()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        # Upper bound for stored publication dates: anything beyond tomorrow
+        # is a backdated print/issue date and gets clamped to 'created'.
+        today_plus_1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
         papers: list[dict] = []
         seen_dois: set[str] = set()
@@ -395,7 +494,7 @@ class CrossrefSensor(BaseSensor):
 
             journal_count = 0
             for work in items:
-                parsed = _parse_work(work)
+                parsed = _parse_work(work, today_plus_1)
                 if not parsed:
                     continue
 

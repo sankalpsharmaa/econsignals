@@ -230,9 +230,12 @@ def load_zotero_corpus(
             text = f"{title} {abstract}".strip() if abstract else title
             if not text or len(text) < 20:
                 continue
+            # Zotero stores dateAdded as space-separated "YYYY-MM-DD HH:MM:SS"
+            # (no 'T'); the prior 'T' format raised on every row and collapsed
+            # the sort key to datetime.min.
             date_str = (r["dateAdded"] or "").strip()
             try:
-                dt = datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S")
+                dt = datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S")
             except (ValueError, TypeError):
                 dt = datetime.min
             corpus.append({
