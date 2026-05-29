@@ -88,8 +88,10 @@ export function PaperCard({ paper, feedback, onFeedback }: PaperCardProps) {
         {displayAuthors && (
           <span className="authors">{displayAuthors}</span>
         )}
-        {paper.source && (
-          <span className="source-badge">{paper.source}</span>
+        {paper.venue ? (
+          <span className="venue" title={paper.source ?? undefined}>{paper.venue}</span>
+        ) : (
+          paper.source && <span className="source-badge">{paper.source}</span>
         )}
         {paper.published_at && (
           <span>{formatDate(paper.published_at)}</span>

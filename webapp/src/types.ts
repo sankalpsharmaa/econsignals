@@ -6,8 +6,10 @@ export interface Paper {
   doi: string | null;
   url: string | null;
   source: string | null;
+  venue: string | null;
   published_at: string | null;
   score: number;
+  zotero?: number | null;
   jel: string[];
   topics: string[];
   india: boolean;
@@ -45,6 +47,7 @@ export interface FeedStats {
   papers: number;
   deadlines: number;
   social: number;
+  personalized?: boolean;
 }
 
 export interface Feed {

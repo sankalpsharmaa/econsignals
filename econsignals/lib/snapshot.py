@@ -246,6 +246,7 @@ def build_snapshot() -> dict:
             "doi": p.get("doi"),
             "url": p.get("url") or (f"https://doi.org/{p['doi']}" if p.get("doi") else None),
             "source": p.get("primary_source"),
+            "venue": unescape(p["primary_venue"]) if p.get("primary_venue") else None,
             "published_at": (p.get("published_at") or "")[:10] or None,
             "score": round(p.get("_final") if p.get("_final") is not None else (p.get("relevance_score") or 0.0), 3),
             "zotero": round(p["_zotero"], 3) if p.get("_zotero") is not None else None,

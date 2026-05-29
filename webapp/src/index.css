@@ -550,6 +550,13 @@ button {
   color: var(--text-muted);
 }
 
+.venue {
+  font-style: italic;
+  font-weight: 500;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
 .score-pill {
   background: var(--bg-secondary);
   border: 1px solid var(--border);

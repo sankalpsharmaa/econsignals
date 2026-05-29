@@ -801,6 +801,64 @@ def get_last_sensor_run(sensor: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _venue_from_meta(raw: str | None) -> str | None:
+    """Extract a human journal/venue name from a source's raw_metadata JSON.
+
+    Handles Crossref (container-title list) and OpenAlex
+    (primary_location.source.display_name) shapes; returns None if absent.
+    """
+    if not raw:
+        return None
+    try:
+        meta = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    ct = meta.get("container-title")
+    if isinstance(ct, list) and ct:
+        return ct[0]
+    if isinstance(ct, str) and ct:
+        return ct
+    loc = meta.get("primary_location") or meta.get("host_venue")
+    if isinstance(loc, dict):
+        src = loc.get("source")
+        if isinstance(src, dict) and src.get("display_name"):
+            return src["display_name"]
+        if loc.get("display_name"):
+            return loc["display_name"]
+    for key in ("journal", "venue", "journal_name"):
+        val = meta.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def _attach_primary_source(conn: sqlite3.Connection, paper: dict) -> None:
+    """Set primary_source, primary_venue, and a fallback url on a paper dict.
+
+    Prefers the Crossref source for the venue (it carries the real journal),
+    falling back to any source that reports one.
+    """
+    rows = conn.execute(
+        "SELECT source, source_url, raw_metadata FROM paper_sources "
+        "WHERE paper_id = ? ORDER BY id",
+        (paper["id"],),
+    ).fetchall()
+    paper["primary_source"] = rows[0]["source"] if rows else None
+    venue = None
+    for r in sorted(rows, key=lambda r: 0 if r["source"] == "crossref" else 1):
+        venue = _venue_from_meta(r["raw_metadata"])
+        if venue:
+            break
+    paper["primary_venue"] = venue
+    if not paper.get("url"):
+        for r in rows:
+            if r["source_url"]:
+                paper["url"] = r["source_url"]
+                break
+
+
 def _attach_authors(conn: sqlite3.Connection, paper: dict) -> dict:
     """Attach a deduplicated, position-ordered author list to a paper dict."""
     author_rows = conn.execute(
@@ -863,14 +921,7 @@ def get_top_papers(limit: int = 200, min_score: float = 0.0) -> list[dict]:
         for row in rows:
             paper = _deserialize_paper(_row_to_dict(row))
             _attach_authors(conn, paper)
-            src = conn.execute(
-                "SELECT source, source_url FROM paper_sources WHERE paper_id = ? "
-                "ORDER BY id LIMIT 1",
-                (paper["id"],),
-            ).fetchone()
-            paper["primary_source"] = src["source"] if src else None
-            if src and src["source_url"] and not paper.get("url"):
-                paper["url"] = src["source_url"]
+            _attach_primary_source(conn, paper)
             papers.append(paper)
     return papers
 
