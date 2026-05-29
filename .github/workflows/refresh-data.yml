@@ -53,15 +53,25 @@ jobs:
       - name: Restore corpus from the data-snapshot release asset
         run: |
           mkdir -p data watches/papers
-          if gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
-               --pattern econsignals.db --dir data --clobber 2>/dev/null; then
+          # Distinguish "no release yet" (first run, fresh start is fine) from
+          # "release exists but the download failed" (a network blip — abort, so
+          # the persist step below can never clobber the stored corpus with an
+          # empty/partial DB).
+          if gh release view data-snapshot --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
+              --pattern econsignals.db --dir data --clobber \
+              || { echo "::error::corpus asset exists but its download failed — aborting to protect the stored corpus"; exit 1; }
+            gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
+              --pattern state.json --dir watches/papers --clobber \
+              || echo "::warning::state.json download failed; sensors will rebuild it"
+            echo "RESTORED_DB_BYTES=$(stat -c%s data/econsignals.db)" >> "$GITHUB_ENV"
+            echo "CORPUS_SAFE=1" >> "$GITHUB_ENV"
             echo "restored DB: $(du -h data/econsignals.db | cut -f1)"
           else
-            echo "no prior DB asset — starting from an empty corpus"
+            echo "no data-snapshot release yet — first run, starting from an empty corpus"
+            echo "RESTORED_DB_BYTES=0" >> "$GITHUB_ENV"
+            echo "CORPUS_SAFE=1" >> "$GITHUB_ENV"
           fi
-          gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
-            --pattern state.json --dir watches/papers --clobber 2>/dev/null \
-            || echo "no prior sensor state — sensors will rebuild it"
 
       - name: Scan sensors + rescore
         run: bash scripts/refresh_data.sh
@@ -72,9 +82,24 @@ jobs:
       - name: Persist the updated corpus back to the release asset
         if: always()
         run: |
+          # Never overwrite the stored corpus unless the restore completed safely
+          # and the new DB is not smaller than what we restored (the corpus only
+          # grows — papers are soft-deleted, never removed). These guards stop a
+          # failed/partial run from clobbering months of accumulated data.
+          if [ "${CORPUS_SAFE:-0}" != "1" ]; then
+            echo "::warning::restore did not complete safely — NOT clobbering the stored corpus"; exit 0
+          fi
+          if [ ! -f data/econsignals.db ]; then
+            echo "::warning::no DB file present — nothing to persist"; exit 0
+          fi
+          NEW_BYTES=$(stat -c%s data/econsignals.db)
+          if [ "${RESTORED_DB_BYTES:-0}" -gt 0 ] && [ "$NEW_BYTES" -lt "$RESTORED_DB_BYTES" ]; then
+            echo "::error::new DB ${NEW_BYTES}B < restored ${RESTORED_DB_BYTES}B — refusing to shrink the stored corpus"; exit 1
+          fi
           gh release view data-snapshot --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create data-snapshot --repo "$GITHUB_REPOSITORY" \
                  --prerelease --title "Rolling data snapshot" \
                  --notes "CI corpus state (SQLite DB + sensor state). Auto-updated by refresh-data.yml; not a software release."
           gh release upload data-snapshot --repo "$GITHUB_REPOSITORY" \
             data/econsignals.db watches/papers/state.json --clobber
+          echo "persisted DB: $(du -h data/econsignals.db | cut -f1) (restored was ${RESTORED_DB_BYTES}B)"

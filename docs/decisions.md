@@ -4,6 +4,21 @@ Append-only audit trail. Newest entries at top. See `~/claude-config/rules/decis
 
 ---
 
+## 2026-05-29 14:48, Decision 22, Harden the CI corpus restore/persist against silent data loss
+
+Stage: code-choice
+Tried:
+  - Original restore: gh release download ... || echo "starting empty", then an unconditional if:always() persist with --clobber — rejected on review: the else-branch fires on ANY transient download failure (not just first run), so a network blip would deploy a near-empty feed AND clobber the 17 MB corpus asset with the sparse DB (silent, unrecoverable)
+  - Discriminate release-absent (fresh start OK) from release-present-but-download-failed (abort); gate persist on a CORPUS_SAFE flag + a never-shrink size check (kept)
+Kept: restore uses `gh release view` to test existence; if the release exists the DB download MUST succeed or the step exits 1 (persist then sees CORPUS_SAFE unset and skips). On success it records RESTORED_DB_BYTES + CORPUS_SAFE=1. Persist (if:always()) uploads only when CORPUS_SAFE=1, the DB file exists, and NEW_BYTES >= RESTORED_DB_BYTES (the corpus only grows — papers are soft-deleted, never removed). Guard logic unit-tested locally across shrink/grow/first-run/abort/unchanged.
+Dropped: the silent empty-start fallback
+Files: .github/workflows/refresh-data.yml
+Assumptions (the part that can be wrong):
+  - SQLite file size is monotonic non-decreasing between runs (no VACUUM in the code path); a benign shrink fails the run safely (corpus kept) rather than clobbering
+  - stat -c%s is the Linux/ubuntu-runner form (correct on the runner; not macOS)
+Verify: a re-triggered run stays green (restore -> CORPUS_SAFE=1, persist uploads the grown DB); simulating a download failure leaves the data-snapshot asset untouched (job fails at restore; persist skips)
+Status: accepted; refines Decision 21
+
 ## 2026-05-29 14:32, Decision 21, Daily CI/CD data refresh via GitHub Actions; persist the 17 MB DB as a release asset; merge revitalize-dashboard -> main
 
 Stage: code-choice
