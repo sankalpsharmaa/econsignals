@@ -33,19 +33,19 @@ _IDENTITY_PATH: Path = PROJ_ROOT / "profile" / "identity.md"
 # Weights are tuned so topical fit (keywords + JEL) dominates. Author proximity
 # is down-weighted because it is pure noise until the user tracks anyone (every
 # OpenAlex paper carries auto-discovered authors). See score_author_proximity.
-_W_JEL: float = 0.22
-_W_KW: float = 0.33
-_W_AUTHOR: float = 0.08
-_W_PRESTIGE: float = 0.10
-_W_RECENCY: float = 0.07
-_W_SOCIAL: float = 0.05
+_W_JEL: float = 0.15
+_W_KW: float = 0.22
+_W_AUTHOR: float = 0.05
+_W_PRESTIGE: float = 0.35
+_W_RECENCY: float = 0.05
+_W_SOCIAL: float = 0.03
 
-# India relevance for an India-PRIMARY researcher: a strong additive floor (so a
-# genuine India paper clears generic global work) plus amplification on topical
-# fit. A paper that merely names India without field relevance gets the floor
-# only, not the amplification, so it cannot top a real urban/land/dev paper.
-_INDIA_FLOOR: float = 0.30
-_INDIA_AMP: float = 0.15
+# India is a topical interest, NOT a quality gate. A flat India floor floated
+# low-tier regional-journal India papers ("health-insurance awareness") above
+# frontier urban/land work. So India only mildly amplifies a paper that already
+# shows topical fit; venue quality (prestige) and Zotero-library similarity do
+# the heavy lifting.
+_INDIA_AMP: float = 0.05
 
 # Keyword topics split by how distinctive they are to this researcher. Core
 # (urban/land/India-structural) topics each count as a full match; broad social-
@@ -78,27 +78,48 @@ _TOP_FIELD_JOURNALS: frozenset[str] = frozenset({
     "journal of urban economics", "jue",
     "journal of human resources", "jhr",
     "journal of labor economics", "jle",
-    "journal of public economics", "jpube", "journal of public economics",
+    "journal of public economics", "jpube",
+    "review of economics and statistics", "restat",
+    "american economic journal",  # AEJ: Applied / Macro / Policy / Micro
+    "world development",
+    "the economic journal", "economic journal",
+    "journal of the european economic association", "jeea",
+    "journal of development studies",
+    "world bank economic review",
+    "economic development and cultural change",
+    "journal of economic geography",
+    "regional science and urban economics",
+    "journal of economic growth",
+    "explorations in economic history",
+    "economic and political weekly",
+    "indian economic review",
 })
 
+# Prestige by source. crossref ingests CURATED elite-journal tables of contents
+# (AER, QJE, JDE, JUE, REStat, AEJ, World Dev, ...), so it is high-quality by
+# construction. openalex is the uncurated Economics field — it pulls regional and
+# predatory journals — so it is LOW by default and only rises when a recognized
+# journal is detected in its metadata. (This pair was previously inverted.)
 _PRESTIGE_SOURCES: dict[str, float] = {
     "nber": 1.0,
-    "openalex": 0.5,   # treated as generic WP unless journal detected
-    "semantic_scholar": 0.5,
-    "repec_nep": 0.5,
-    "crossref": 0.35,
-    "worldbank": 0.5,
-    "imf": 0.5,
-    "iza": 0.5,
-    "bread": 0.5,
-    "igc": 0.4,
-    "india_think_tanks": 0.4,
-    "rbi": 0.4,
-    "mospi": 0.4,
-    "jpal_sa": 0.4,
-    "bluesky": 0.2,
-    "mastodon": 0.2,
-    "twitter_bridge": 0.2,
+    "crossref": 0.80,
+    "worldbank": 0.60,
+    "iza": 0.60,
+    "bread": 0.60,
+    "repec_nep": 0.50,
+    "imf": 0.50,
+    "semantic_scholar": 0.45,
+    "igc": 0.45,
+    "jpal_sa": 0.45,
+    "india_think_tanks": 0.40,
+    "rbi": 0.40,
+    "mospi": 0.40,
+    "openalex": 0.30,   # uncurated; rises only if a known journal is detected
+    "rss_feeds": 0.30,
+    "bluesky": 0.15,
+    "mastodon": 0.15,
+    "twitter": 0.15,
+    "twitter_bridge": 0.15,
 }
 
 # ---------------------------------------------------------------------------
@@ -629,11 +650,10 @@ def score_paper(
         + _W_SOCIAL * s_social
     )
 
-    # India relevance: a strong floor (this researcher is India-primary) plus
-    # amplification on topical fit, so genuine India papers clear generic global
-    # work while a bare India mention without field relevance gets the floor only.
+    # India mildly amplifies a paper that already shows topical fit; it is not a
+    # quality floor (see _INDIA_AMP). Quality and library-similarity rank the feed.
     if india_boost(title, abstract, paper_id, db):
-        weighted += _INDIA_FLOOR + _INDIA_AMP * max(s_jel, s_kw)
+        weighted += _INDIA_AMP * max(s_jel, s_kw)
 
     return min(1.0, weighted)
 

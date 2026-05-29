@@ -15,6 +15,7 @@ CLI:  python -m econsignals.lib.snapshot [output_path]
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from datetime import date, datetime, timezone
@@ -33,6 +34,8 @@ from econsignals.lib.relevance import (
     _INDIA_PATTERNS,
     load_interest_keywords,
 )
+from econsignals.lib.zotero_embeddings import compute_zotero_embedding_scores
+from econsignals.lib.zotero_profile import load_zotero_corpus
 
 def unescape(text: str) -> str:
     """Decode HTML entities, applied twice since some sources double-encode
@@ -70,6 +73,17 @@ _ECON_HANDLES = frozenset({
 _MAX_PAPERS = 250
 _MAX_SOCIAL = 60
 _ABSTRACT_CHARS = 320
+
+# Zotero re-ranking: similarity to the user's own library is the strongest taste
+# signal, so the feed is ranked by a blend of it and the base relevance (quality)
+# score. _CANDIDATE_POOL papers are embedded; the top _MAX_PAPERS are kept.
+_CANDIDATE_POOL = 600
+_ZOTERO_WEIGHT = 0.45
+# Zotero top-k similarity saturates near 7.0 for anything econ-ish and drops to
+# ~2.5 for off-topic work, so normalize on a FIXED scale (min-max would collapse
+# the homogeneous top). This demotes the off-topic tail while letting venue
+# prestige (in relevance_score) rank the on-topic frontier.
+_ZSIM_LO, _ZSIM_HI = 3.0, 7.0
 
 
 def _is_caption(text: str | None) -> bool:
@@ -161,13 +175,55 @@ def _urgency(days: int | None) -> str:
     return "upcoming"
 
 
+def _personalize(papers: list[dict]) -> tuple[list[dict], bool]:
+    """Re-rank candidates by similarity to the user's Zotero library.
+
+    Library similarity is the strongest signal of what the user actually reads,
+    so the feed is sorted by a blend of normalized Zotero similarity and the base
+    relevance (quality) score. Each paper gets `_zotero` (0-1) and `_final` (the
+    blend). Falls back to relevance order, returning personalized=False, when
+    Ollama or the Zotero corpus is unavailable or scoring fails.
+    """
+    for p in papers:
+        p["_zotero"] = None
+        p["_final"] = p.get("relevance_score") or 0.0
+
+    if os.environ.get("ECONSIGNALS_NO_ZOTERO"):
+        return papers, False
+    try:
+        corpus = load_zotero_corpus()
+        if not corpus:
+            return papers, False
+        cands = [
+            {"title": p.get("title") or "", "abstract": p.get("abstract") or ""}
+            for p in papers
+        ]
+        scores = compute_zotero_embedding_scores(cands, corpus)
+    except Exception as exc:  # Ollama down, model missing, corpus unreadable
+        print(f"[snapshot] Zotero personalization skipped: {exc}", file=sys.stderr)
+        return papers, False
+
+    if not scores or len(scores) != len(papers) or max(scores) <= 0:
+        return papers, False
+
+    span = _ZSIM_HI - _ZSIM_LO
+    for p, s in zip(papers, scores):
+        z = max(0.0, min(1.0, (s - _ZSIM_LO) / span))
+        p["_zotero"] = z
+        p["_final"] = _ZOTERO_WEIGHT * z + (1 - _ZOTERO_WEIGHT) * (p.get("relevance_score") or 0.0)
+    papers.sort(key=lambda p: p["_final"], reverse=True)
+    return papers, True
+
+
 def build_snapshot() -> dict:
     """Assemble the dashboard snapshot dict from the current database."""
     interest_kw = load_interest_keywords()
     now = datetime.now(timezone.utc)
 
-    # Papers: best by relevance regardless of age (data may be stale), denoised
-    papers_raw = get_top_papers(limit=_MAX_PAPERS * 2, min_score=0.0)
+    # Papers: take a quality-ranked candidate pool, then re-rank by similarity to
+    # the user's Zotero library (their actual taste), then denoise.
+    papers_raw = get_top_papers(limit=_CANDIDATE_POOL, min_score=0.0)
+    papers_raw, personalized = _personalize(papers_raw)
     papers = []
     for p in papers_raw:
         # Source titles/abstracts often carry HTML entities ("&amp;", "&lt;");
@@ -191,7 +247,8 @@ def build_snapshot() -> dict:
             "url": p.get("url") or (f"https://doi.org/{p['doi']}" if p.get("doi") else None),
             "source": p.get("primary_source"),
             "published_at": (p.get("published_at") or "")[:10] or None,
-            "score": round(p.get("relevance_score") or 0.0, 3),
+            "score": round(p.get("_final") if p.get("_final") is not None else (p.get("relevance_score") or 0.0), 3),
+            "zotero": round(p["_zotero"], 3) if p.get("_zotero") is not None else None,
             "jel": p.get("jel_codes") or [],
             "topics": topics,
             "india": is_india,
@@ -253,6 +310,7 @@ def build_snapshot() -> dict:
             "papers": len(papers),
             "deadlines": len(deadlines),
             "social": len(social),
+            "personalized": personalized,
         },
         "papers": papers,
         "deadlines": deadlines,
