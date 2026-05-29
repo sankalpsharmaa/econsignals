@@ -4,6 +4,21 @@ Append-only audit trail. Newest entries at top. See `~/claude-config/rules/decis
 
 ---
 
+## 2026-05-28 21:30, Decision 11, Rank feed by venue quality + Zotero similarity (user said feed was irrelevant)
+
+Stage: divergence
+Tried:
+  - India-floor-dominant scoring (Decision 6): surfaced low-tier regional-journal India papers (health-insurance KAP, financial-inclusion surveys)
+  - Prestige-dominant + Zotero-library similarity (kept)
+Kept: (1) Fixed inverted prestige — crossref (curated elite-journal TOCs) + NBER high, openalex (uncurated Economics field) low unless a known journal is detected; prestige is now the dominant weight (0.35). (2) Dropped the +0.30 India floor; India amplifies topical fit by 0.05 only. (3) Dashboard ranks by a blend of venue quality and similarity to the user's Zotero library (top-k embedding); Zotero demotes off-topic work (it saturates ~7.0 for econ, ~2.5 off-topic), prestige ranks the on-topic frontier.
+Dropped: India-as-quality-gate (floated junk); min-max Zotero normalization (collapsed on a homogeneous pool -> fixed scale 3.0-7.0)
+Files: econsignals/lib/relevance.py (weights, prestige table, journals, India), econsignals/lib/snapshot.py (_personalize)
+Assumptions (can be wrong):
+  - User reads elite-journal / NBER frontier work, not uncurated regional journals (confirmed by Zotero: urban/land/housing/migration)
+  - crossref ISSN list = elite journals, so source=crossref is a reliable quality proxy
+Verify: python -m econsignals.lib.relevance && python -m econsignals.lib.snapshot; top-22 of feed.json are crossref frontier econ (migration/firms/urban/housing), no regional-journal KAP papers
+Status: accepted
+
 ## 2026-05-28 20:30, Decision 10, Publish site via separate public repo; keep code private
 
 Stage: divergence
