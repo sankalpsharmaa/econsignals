@@ -4,6 +4,22 @@ Append-only audit trail. Newest entries at top. See `~/claude-config/rules/decis
 
 ---
 
+## 2026-05-29 15:10, Decision 23, Remove dead Exa tweet-search paths from twitter_bridge (Exa deprecated the tweet category)
+
+Stage: code-choice
+Tried:
+  - Keep the category="tweet" Exa calls — rejected: Exa returns HTTP 400 "The \"tweet\" category is no longer supported"; a live probe with the real key confirmed it (minimal query -> 200, tweet -> 400), and include_domains=[x.com,twitter.com] returns only non-Twitter pages, so Exa cannot deliver tweets at all
+  - Repoint the tweet calls to a domain filter — rejected: yields no actual tweets
+  - Remove the two dead tweet-collection paths; keep RSS as the primary source + the working category="research paper" DOI resolver; native social comes from the bluesky sensor (kept)
+Kept: deleted _collect_exa (paper-announcement tweets) and _collect_funding_tweets (CFP tweets) plus their now-orphaned helpers (EXA_QUERIES, EXA_FUNDING_QUERIES, _FUNDING_RE, _IMAGE_CAPTION_RE/_is_image_caption, _MONTH_MAP/_DATE_PATTERNS/_extract_deadline_date) and a duplicated _PAPER_SIGNAL_RE. collect() is now RSS-only; run() no longer extracts funding-from-tweets (funding.py owns funding — Decision 19). The research-paper resolver is unchanged. Probe showed Exa honors snake_case keys, so _exa.py is untouched.
+Dropped: tweet-sourced social_items + funding-from-tweets (both produced nothing since Exa's deprecation; every run wasted two 400ing calls)
+Files: econsignals/sensors/twitter_bridge.py
+Assumptions (the part that can be wrong):
+  - No external module/test imported the removed symbols (verified: git grep clean; no test imports twitter_bridge)
+  - Native social coverage now relies on the bluesky sensor (needs BLUESKY_HANDLE/BLUESKY_APP_PASSWORD secrets) + RSS
+Verify: PYTHONPATH=. python -m pytest tests/ -q  (248 passed, 1 skipped); TwitterBridgeSensor().collect() returns ~914 RSS items with zero Exa-tweet 400s
+Status: accepted
+
 ## 2026-05-29 14:48, Decision 22, Harden the CI corpus restore/persist against silent data loss
 
 Stage: code-choice

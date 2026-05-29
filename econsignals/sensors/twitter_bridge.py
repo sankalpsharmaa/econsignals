@@ -1,10 +1,9 @@
-"""Twitter/X sensor for EconSignals.
+"""Twitter/X-adjacent social sensor for EconSignals.
 
-Tries two methods in order:
-  1. Exa API tweet search (best quality, needs EXA_API_KEY)
-  2. Public economics RSS/Atom feeds that aggregate Twitter discourse
-
-Falls back gracefully — always returns whatever it can find.
+Exa deprecated its tweet category (it no longer has X/Twitter coverage), so
+this sensor surfaces economics social discourse from public RSS/Atom feeds and
+uses Exa only to resolve the papers those posts announce. Native social posts
+come from the dedicated `bluesky` sensor.
 
 Usage:
     python sensors/twitter_bridge.py
@@ -25,97 +24,7 @@ from econsignals.sensors._base import BaseSensor
 from econsignals.sensors._exa import exa_search
 
 # ---------------------------------------------------------------------------
-# Exa search queries for economics tweets
-# ---------------------------------------------------------------------------
-
-# --- Research paper / social post queries (consolidated for fewer API calls) ---
-EXA_QUERIES: list[str] = [
-    "India housing land urban zoning property rights urbanization new paper working paper",
-    "development economics RCT causal inference difference-in-differences new results paper",
-    "labor economics migration informal sector women gender developing countries South Asia",
-    "urban economics housing supply regulation real estate land use spatial new paper",
-    "Gyourko Duranton Brueckner Henderson Olken Deininger Heckman economics new paper",
-    "#EconTwitter #DevEcon new working paper NBER",
-]
-
-# --- Funding / grants / CFP queries (consolidated) ---
-EXA_FUNDING_QUERIES: list[str] = [
-    "PEDL STEG IGC CEPR call for proposals funding deadline development economics",
-    "J-PAL economics research grant funding call for proposals poverty inequality",
-    "development economics urban housing India research grant fellowship deadline 2026",
-    "economics conference call for papers submission deadline CFP NBER IZA BREAD 2026",
-    "NSF economics grant SES social sciences research funding deadline",
-]
-
-_FUNDING_RE = re.compile(
-    r"\b(deadline|call for (proposals?|papers?|applications?)|"
-    r"funding|grant|fellowship|apply by|submit by|CFP|"
-    r"applications? (open|due|close)|proposals? due)\b",
-    re.IGNORECASE,
-)
-
-# Exa fills the `highlights` field of a tweet with an AI description of the
-# tweet's attached image or linked page (e.g. "The image prominently displays
-# the Artha journal cover..."), never the actual post. Drop any content that
-# is clearly such a caption rather than a real post.
-_IMAGE_CAPTION_RE = re.compile(
-    r"^\s*(the|this)\s+(image|photo|photograph|graphic|picture|illustration|"
-    r"screenshot|infographic|chart|figure|visual)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_image_caption(text: str) -> bool:
-    """True if `text` reads like an Exa AI image/page caption, not a real post.
-
-    Heuristics: starts with an image-description phrase, or carries neither a
-    URL nor an @handle (real posts almost always include one or the other).
-    """
-    if not text:
-        return True
-    if _IMAGE_CAPTION_RE.match(text):
-        return True
-    # A genuine post usually contains a link or an @mention; a bare prose
-    # description of an image typically has neither.
-    has_url = "http" in text
-    has_handle = bool(re.search(r"@\w", text))
-    return not (has_url or has_handle)
-
-_MONTH_MAP = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
-    "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
-    "november": 11, "nov": 11, "december": 12, "dec": 12,
-}
-
-_DATE_PATTERNS = [
-    re.compile(r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})[,\s]+(\d{4})", re.I),
-    re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2})[,\s]+(\d{4})", re.I),
-    re.compile(r"(\d{4})-(\d{2})-(\d{2})"),
-]
-
-
-def _extract_deadline_date(text: str) -> str | None:
-    """Try to find a deadline date in tweet text. Returns YYYY-MM-DD or None."""
-    for pat in _DATE_PATTERNS:
-        m = pat.search(text)
-        if not m:
-            continue
-        g = m.groups()
-        try:
-            if g[0].isdigit() and len(g[0]) == 4:
-                return f"{int(g[0]):04d}-{int(g[1]):02d}-{int(g[2]):02d}"
-            month = _MONTH_MAP.get(g[0].lower().rstrip("."), 0)
-            if month:
-                day, year = int(g[1]), int(g[2])
-                if 1 <= day <= 31 and 2024 <= year <= 2030:
-                    return f"{year:04d}-{month:02d}-{day:02d}"
-        except (ValueError, IndexError):
-            continue
-    return None
-
-# ---------------------------------------------------------------------------
-# Fallback: public feeds that surface Twitter-adjacent econ discourse
+# Public feeds that surface Twitter-adjacent econ discourse
 # ---------------------------------------------------------------------------
 
 FALLBACK_FEEDS: dict[str, str] = {
@@ -184,7 +93,11 @@ def _text(el: ET.Element | None) -> str:
 
 
 class TwitterBridgeSensor(BaseSensor):
-    """Collect economics social content via Exa or RSS fallback."""
+    """Collect economics social discourse from public RSS feeds.
+
+    Exa is used only to resolve papers announced in those posts; the Exa
+    tweet-search path was removed when Exa dropped its tweet category.
+    """
 
     name = "twitter_bridge"
     watch = "social"
@@ -203,73 +116,6 @@ class TwitterBridgeSensor(BaseSensor):
             return paper["id"] if paper else None
         except Exception:
             return None
-
-    def _collect_exa(self) -> list[dict]:
-        items: list[dict] = []
-        seen: set[str] = set()
-
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-
-        for query in EXA_QUERIES:
-            results = exa_search(
-                query,
-                category="tweet",
-                num_results=25,
-                max_characters=600,
-                start_published_date=cutoff,
-                log_prefix="[twitter_bridge]",
-            )
-            if not results:
-                continue
-
-            print(f"[twitter_bridge] exa query={query!r}: {len(results)} results", file=sys.stderr)
-
-            for r in results:
-                url = (r.get("url") or "").strip()
-                if not url:
-                    continue
-                source_id = f"twitter:{url}"
-                if source_id in seen:
-                    continue
-                seen.add(source_id)
-
-                # Prefer the real post body; the AI-generated highlight is only
-                # a fallback summary, never the stored content.
-                text = (r.get("text") or "").strip()
-                highlights = r.get("highlights") or []
-                hl_text = " ".join(highlights) if isinstance(highlights, list) else ""
-                content = (text or hl_text).strip()
-                if not content:
-                    continue
-
-                # Drop items whose only content is an Exa image/page caption
-                # rather than an actual tweet.
-                if not text and _is_image_caption(hl_text):
-                    continue
-                if text and _is_image_caption(text) and not hl_text.strip():
-                    continue
-
-                # Resolve the handle from Exa's author field or the URL, then
-                # normalize to exactly one leading '@' (avoids '@@handle').
-                author = (r.get("author") or "").strip()
-                if not author:
-                    m = re.search(r"(?:twitter\.com|x\.com)/([^/]+)", url)
-                    author = m.group(1) if m else "unknown"
-                author = "@" + author.lstrip("@")
-
-                items.append({
-                    "source": "twitter",
-                    "source_id": source_id,
-                    "author_handle": author,
-                    "content": content[:2000],
-                    "url": url,
-                    "paper_id": self._match_paper(self._extract_doi(content)),
-                    "engagement_score": float(r.get("score") or 0),
-                    "published_at": r.get("publishedDate") or r.get("published_date"),
-                })
-
-        return items
 
     def _fetch_feed(self, url: str) -> bytes:
         return self.fetch_url(url, timeout=20)
@@ -345,15 +191,8 @@ class TwitterBridgeSensor(BaseSensor):
         re.IGNORECASE,
     )
 
-    _PAPER_SIGNAL_RE = re.compile(
-        r"\b(new (working )?paper|paper alert|new research|working paper|"
-        r"wp\s*\d|nber|ssrn|published in|forthcoming|accepted at|"
-        r"our (new |latest )?paper|just released|new study)\b",
-        re.IGNORECASE,
-    )
-
     def _ingest_papers_from_tweets(self, items: list[dict], max_lookups: int = 12) -> int:
-        """Find papers mentioned in tweets via Exa paper search, then ingest them."""
+        """Find papers announced in feed posts via Exa paper search, then ingest them."""
         from econsignals.lib.db import (
             insert_paper, insert_paper_source,
             upsert_author, link_paper_author,
@@ -368,7 +207,7 @@ class TwitterBridgeSensor(BaseSensor):
             return 0
 
         print(
-            f"[twitter_bridge] {len(candidates)} tweets look like paper announcements, "
+            f"[twitter_bridge] {len(candidates)} posts look like paper announcements, "
             f"searching top {min(len(candidates), max_lookups)}",
             file=sys.stderr,
         )
@@ -436,9 +275,9 @@ class TwitterBridgeSensor(BaseSensor):
                 if not paper_id:
                     continue
 
-                tweet_url = item.get("url") or ""
+                post_url = item.get("url") or ""
                 sid = f"twitter:{hashlib.md5((url or title).encode()).hexdigest()[:12]}"
-                insert_paper_source(paper_id, "twitter", sid, tweet_url)
+                insert_paper_source(paper_id, "twitter", sid, post_url)
 
                 for pos, name in enumerate(authors[:6]):
                     if name:
@@ -451,85 +290,15 @@ class TwitterBridgeSensor(BaseSensor):
 
         return ingested
 
-    def _collect_funding_tweets(self) -> list[dict]:
-        """Search for funding/grant/CFP tweets and extract deadlines."""
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-        deadlines: list[dict] = []
-
-        for query in EXA_FUNDING_QUERIES:
-            results = exa_search(
-                query,
-                category="tweet",
-                num_results=10,
-                max_characters=800,
-                start_published_date=cutoff,
-                log_prefix="[twitter_bridge]",
-            )
-            if not results:
-                continue
-
-            print(f"[twitter_bridge] funding query={query!r}: {len(results)} results", file=sys.stderr)
-
-            for r in results:
-                # Prefer the real post body; fall back to the highlight only.
-                text = (r.get("text") or "").strip()
-                highlights = r.get("highlights") or []
-                hl_text = " ".join(highlights) if isinstance(highlights, list) and highlights else ""
-                content = (text or hl_text).strip()
-                if not content or not _FUNDING_RE.search(content):
-                    continue
-
-                # Skip Exa image/page captions masquerading as posts.
-                if not text and _is_image_caption(hl_text):
-                    continue
-
-                # A curated deadline must carry a real date; tweets with no
-                # parseable deadline are not written to the deadlines table.
-                url = (r.get("url") or "").strip()
-                deadline_date = _extract_deadline_date(content)
-                if not deadline_date:
-                    continue
-                name = content[:120].replace("\n", " ").strip()
-                if len(name) > 100:
-                    name = name[:100] + "..."
-
-                relevance = 0.5
-                content_lower = content.lower()
-                for kw in ("pedl", "steg", "igc", "j-pal", "jpal", "nber",
-                           "development economics", "urban economics",
-                           "housing", "land", "india", "south asia",
-                           "labor", "migration", "poverty", "inequality"):
-                    if kw in content_lower:
-                        relevance = min(relevance + 0.1, 0.95)
-
-                deadlines.append({
-                    "type": "funding",
-                    "name": name,
-                    "organization": "Twitter/X",
-                    "deadline_date": deadline_date,
-                    "event_date": None,
-                    "url": url,
-                    "description": content[:300],
-                    "relevance_score": relevance,
-                })
-
-        print(f"[twitter_bridge] extracted {len(deadlines)} funding deadlines from tweets", file=sys.stderr)
-        return deadlines
-
     def collect(self) -> list[dict]:
-        exa_items = self._collect_exa()
-        if exa_items:
-            print(f"[twitter_bridge] exa returned {len(exa_items)} items", file=sys.stderr)
-            return exa_items
-
-        print("[twitter_bridge] exa unavailable, falling back to RSS feeds", file=sys.stderr)
+        # Exa deprecated its tweet category, so social discourse now comes from
+        # the public econ RSS/Atom feeds; the bluesky sensor covers native posts.
         rss_items = self._collect_rss()
         print(f"[twitter_bridge] rss collected {len(rss_items)} items", file=sys.stderr)
         return rss_items
 
     def run(self) -> dict:
-        from econsignals.lib.db import log_sensor_start, log_sensor_end, insert_social_item, upsert_deadline
+        from econsignals.lib.db import log_sensor_start, log_sensor_end, insert_social_item
 
         run_id = log_sensor_start(self.name, self.watch)
 
@@ -547,14 +316,7 @@ class TwitterBridgeSensor(BaseSensor):
 
             paper_count = self._ingest_papers_from_tweets(items)
             if paper_count:
-                print(f"[twitter_bridge] ingested {paper_count} new papers from tweet DOIs", file=sys.stderr)
-
-            funding = self._collect_funding_tweets()
-            for dl in funding:
-                try:
-                    upsert_deadline(dl)
-                except Exception as exc:
-                    print(f"[twitter_bridge] deadline upsert error: {exc}", file=sys.stderr)
+                print(f"[twitter_bridge] ingested {paper_count} new papers from feed posts", file=sys.stderr)
 
             log_sensor_end(
                 run_id, "success",
