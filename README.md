@@ -57,7 +57,13 @@ A React + Vite single-page app in [`webapp/`](webapp/). It reads a static snapsh
 | Production build | `cd webapp && npm run build` → `webapp/dist/` |
 | Live backend (optional) | `econsignals-web` |
 
-**Deploy:** pushing to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which builds the SPA and publishes it to GitHub Pages. Refresh the data by running `econsignals-snapshot` and committing the updated `feed.json` before you push. (Enable Pages once under repo Settings → Pages → Source: GitHub Actions.)
+**Deploy:** this code repo stays **private**; the built dashboard is published to a separate **public** repo (`sankalpsharmaa.github.io`) that serves it at the Pages URL. One command does it:
+
+```bash
+bash scripts/deploy_site.sh
+```
+
+It rebuilds the snapshot + app and pushes the static output to `sankalpsharmaa.github.io/econsignals/` (creating the public repo and enabling Pages on first run). Re-run it whenever you want to refresh the live data.
 
 ---
 

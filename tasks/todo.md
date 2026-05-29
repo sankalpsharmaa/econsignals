@@ -25,10 +25,15 @@ dashboard to sankalpsharmaa.github.io/econsignals. Decisions logged in `docs/dec
 - [x] GitHub Action: build + deploy to Pages
 - [~] Core regression tests (relevance/denoise)
 
-## Phase 4 — Deploy
-- [ ] Integrate sensor fixes + frontend; refresh data; rebuild snapshot
-- [ ] Confirm repo->public mechanics (code public vs assets-only public)
-- [ ] Verify: pytest green, vite build, site loads + filters with no backend, live URL
+## Phase 4 — Deploy ✓
+- [x] Integrate sensor fixes (110 tests green) + frontend; refresh data (1025 papers); rebuild snapshot
+- [x] Decision: keep code private, publish site to separate public repo
+- [x] Verify: 110 tests green; clean npm ci build; interactions work (search/India/star persist); LIVE at https://sankalpsharmaa.github.io/econsignals/
+
+## Review
+- Live dashboard: https://sankalpsharmaa.github.io/econsignals/ (deploy: `bash scripts/deploy_site.sh`)
+- Code committed locally on branch `revitalize-dashboard` (NOT pushed — code repo stays private). Push/merge when ready.
+- Remaining/optional: redesign email newsletter cosmetics; broaden curated funder calendar; add IZA/BREAD markup canary tests; wire dashboard 👍/👎 export back into jel_weights as a batch.
 
 ## Review
 (to be filled after completion)

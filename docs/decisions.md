@@ -4,6 +4,21 @@ Append-only audit trail. Newest entries at top. See `~/claude-config/rules/decis
 
 ---
 
+## 2026-05-28 20:30, Decision 10, Publish site via separate public repo; keep code private
+
+Stage: divergence
+Tried:
+  - Make econsignals repo public + in-repo Pages Action (exact URL, simplest, but exposes code+history)
+  - Keep code private, publish built assets to a public sankalpsharmaa.github.io user-site repo (user's choice, kept)
+Kept: code repo stays private; scripts/deploy_site.sh builds snapshot+app and pushes webapp/dist into sankalpsharmaa.github.io/econsignals/. Removed the in-repo Pages workflow (wrong mechanism, would fail on a private repo).
+Dropped: in-repo GitHub Pages Action (.github/workflows/deploy.yml deleted)
+Files: scripts/deploy_site.sh (new), README.md, removed .github/workflows/deploy.yml
+Assumptions (can be wrong):
+  - Publishing the personalized feed.json (rankings, social handles) is acceptable to the user (confirmed: chose "publish site only")
+  - User-site repo Pages auto-enables and serves /econsignals/ subpath
+Verify: curl -s -o /dev/null -w '%{http_code}' https://sankalpsharmaa.github.io/econsignals/ -> 200; feed.json -> 200 (verified live)
+Status: accepted
+
 ## 2026-05-28 19:30, Decision 9, OpenAlex collects broadly; India is a ranking preference, not a collection filter
 
 Stage: code-choice
