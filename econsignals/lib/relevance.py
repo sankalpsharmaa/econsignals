@@ -109,6 +109,7 @@ _PRESTIGE_SOURCES: dict[str, float] = {
     "repec_nep": 0.50,
     "imf": 0.50,
     "semantic_scholar": 0.45,
+    "arxiv": 0.45,
     "igc": 0.45,
     "jpal_sa": 0.45,
     "india_think_tanks": 0.40,
@@ -762,6 +763,85 @@ def update_jel_weights(paper_id: int, is_interesting: bool) -> None:
     # Invalidate cache so next load picks up the new weights
     global _jel_weights_cache
     _jel_weights_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Per-batch percentile rank-space combination
+# ---------------------------------------------------------------------------
+
+def _percentile_ranks(values: list[float]) -> list[float]:
+    """Map a batch of raw scores to within-batch percentile ranks in [0, 1].
+
+    Uses average-rank percentiles so that equal raw values receive equal
+    percentiles (ties are respected). A single-element batch maps to 1.0 and an
+    all-equal batch maps every element to the same percentile, so a monotone
+    transform of one channel preserves the input order.
+
+    Args:
+        values: Raw scores for one channel, one per paper in the batch.
+
+    Returns:
+        Percentile ranks aligned to `values`; empty list for empty input.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [1.0]
+
+    # Average competition rank: tied values share the mean of the ranks they span.
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        # ranks i..j are tied; assign their average 1-based rank.
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+
+    # Normalize 1..n ranks into (0, 1]; the top score maps to 1.0.
+    return [r / n for r in ranks]
+
+
+def combine_percentile_ranks(channels: dict[str, list[float] | None]) -> list[float]:
+    """Combine several score channels in per-batch percentile (rank) space.
+
+    Each channel is independently mapped to within-batch percentile ranks, then
+    the present channels are averaged with equal weight. Working in rank space
+    makes the channels scale-free, so no single channel dominates and daily
+    cohorts are comparable; equal weighting ensures relevance, Zotero similarity,
+    and the learned ranker each contribute equally.
+
+    A channel whose value is None (e.g. the learned ranker reported no model) is
+    dropped from the average rather than treated as zeros, so an absent channel
+    neither helps nor hurts. With exactly one present channel the result is that
+    channel's percentile ranks, a monotone transform of its raw scores that
+    preserves the input order.
+
+    Args:
+        channels: Map of channel name -> aligned raw scores (or None to omit).
+            Every present channel must have the same length.
+
+    Returns:
+        Equal-weight mean percentile per paper, aligned to the inputs. Empty list
+        when no channel is present or the batch is empty.
+    """
+    present = [v for v in channels.values() if v is not None]
+    if not present:
+        return []
+
+    n = len(present[0])
+    if n == 0:
+        return []
+    if any(len(v) != n for v in present):
+        raise ValueError("combine_percentile_ranks: channels have unequal lengths")
+
+    ranked = [_percentile_ranks(v) for v in present]
+    return [sum(r[i] for r in ranked) / len(ranked) for i in range(n)]
 
 
 # ---------------------------------------------------------------------------

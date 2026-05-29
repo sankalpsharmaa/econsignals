@@ -21,6 +21,12 @@ export function getFeedback(store: FeedbackStore, id: number): PaperFeedback {
   return store[String(id)] ?? { starred: false, vote: null, hidden: false };
 }
 
+// Second-precision UTC stamp matching Python's %Y-%m-%dT%H:%M:%SZ so importing
+// into data/feedback.jsonl yields lines byte-compatible with /api/feedback.
+function nowStamp(): string {
+  return new Date().toISOString().slice(0, 19) + 'Z';
+}
+
 export function setFeedback(
   store: FeedbackStore,
   id: number,
@@ -28,6 +34,12 @@ export function setFeedback(
 ): FeedbackStore {
   const current = getFeedback(store, id);
   const next = { ...current, ...update };
+  // Stamp the vote time only when this update sets an up/down vote, so the
+  // exported store carries a stable timestamp per vote (not per export).
+  // A stable stamp is what makes the Python import idempotent.
+  if ('vote' in update && (update.vote === 'up' || update.vote === 'down')) {
+    next.votedAt = nowStamp();
+  }
   const updated = { ...store, [String(id)]: next };
   saveFeedback(updated);
   return updated;

@@ -32,7 +32,7 @@ Run all sensors in a watch. If no watch is given, run all watches sequentially.
 
 | Category | Sensors |
 |-|-|
-| Papers | openalex, crossref, iza, bread, imf |
+| Papers | openalex, crossref, iza, bread, imf, nep, nber, arxiv_econ, worldbank, semantic_scholar |
 | Social | mastodon, bluesky, twitter_bridge |
 | Deadlines | funding, conferences |
 

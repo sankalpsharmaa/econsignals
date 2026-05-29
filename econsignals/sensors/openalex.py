@@ -46,6 +46,43 @@ _PRIMARY_FIELD_ID = "fields/20"
 # ECONSIGNALS_OPENALEX_COUNTRIES="IN|BD|PK|LK|NP" to restrict collection instead.
 _COUNTRIES_ENV = "ECONSIGNALS_OPENALEX_COUNTRIES"
 
+# Work-type gate. Keep journal articles AND preprints/working papers (preprint
+# covers NBER/IZA-style repository working papers carried by OpenAlex). Dropping
+# the everything-else types (dataset, dissertation, paratext, ...) removes a
+# layer of non-paper noise the primary-field gate leaves behind.
+_TYPES = "article|preprint"
+
+# Venue-container gate. A real paper sits in a journal OR a working-paper
+# repository (NBER and IZA are type=repository in OpenAlex). Requiring one of
+# these source types drops conference proceedings, ebook-platform items, and
+# database/dataset containers, while preserving genuine working papers (283 of
+# 289 in-field preprints survive over a 7-day window; the dropped ~6 have
+# null/other-typed sources). Verified 2026-05-28: the field gate alone returns
+# 2925 works over a 7-day lookback; adding the work-type and source-type gates
+# returns 2807 — the ~118-work cut is non-paper container types, NOT regional or
+# predatory econ journals (those are type=journal and survive every gate here).
+# Predatory/regional suppression is left to the relevance-ranking layer and to
+# the opt-in venue allowlist below; this gate only removes non-paper noise.
+_SOURCE_TYPES = "journal|repository"
+
+# CONSTANT opt-in econ-journal venue allowlist (OpenAlex source IDs for the
+# top general-interest journals). This is ADDITIVE and OFF by default: OpenAlex
+# top-level filters are AND-ed, so listing source IDs as a base filter would
+# *hard-restrict* the feed to these venues (verified: AND-ing the allowlist with
+# the field gate returns 0 over a 7-day window). To stay additive, the allowlist
+# is only consulted as a SUPPLEMENTARY pass when ECONSIGNALS_OPENALEX_VENUE_ALLOWLIST
+# is set; that pass unions allowlisted-venue economics papers into the base
+# results so a flagship-journal article is never paged out. Source IDs verified
+# live 2026-05-28 via the /sources endpoint.
+_VENUE_ALLOWLIST_ENV = "ECONSIGNALS_OPENALEX_VENUE_ALLOWLIST"
+_VENUE_ALLOWLIST: tuple[str, ...] = (
+    "S23254222",   # American Economic Review
+    "S203860005",  # The Quarterly Journal of Economics
+    "S95323914",   # Journal of Political Economy
+    "S95464858",   # Econometrica
+    "S88935262",   # The Review of Economic Studies
+)
+
 # Polite-pool contact email. OpenAlex routes a valid, monitored address to the
 # faster pool; a placeholder example.com does not reliably qualify.
 _DEFAULT_EMAIL = "sankalp.sharma437@gmail.com"
@@ -361,34 +398,60 @@ class OpenAlexSensor(BaseSensor):
             "%Y-%m-%d"
         )
 
-    def _build_url(self, from_date: str, page: int) -> str:
-        """Build the full OpenAlex /works URL for a given page.
+    def _build_filter(self, from_date: str, venue_only: bool = False) -> str:
+        """Build the OpenAlex ``filter`` string for the /works query.
 
-        Gates on the work's primary field (Economics), which drops the
-        crypto/coffee/CompSci papers that merely carried a low-score Economics
-        concept tag. An optional author-country scope is added only when
-        ECONSIGNALS_OPENALEX_COUNTRIES is set (default: collect broadly).
+        Gates on the work's primary field (Economics), the work type
+        (article/preprint), and the venue-container type (journal/repository).
+        Together these drop the crypto/coffee/CompSci papers that merely carry a
+        low-score Economics concept tag plus the dataset/proceedings containers
+        that regional and predatory drift rides in on. An optional author-country
+        scope is added only when ECONSIGNALS_OPENALEX_COUNTRIES is set (default:
+        collect broadly).
 
         Args:
             from_date: Lower bound date string 'YYYY-MM-DD'.
-            page: 1-based page number.
+            venue_only: When True, append the constant venue allowlist as an
+                ``primary_location.source.id`` OR-group. This is the
+                supplementary, opt-in pass (off by default); it broadens the
+                feed with flagship-journal articles rather than restricting it.
 
         Returns:
-            Fully-qualified URL string.
+            Comma-joined OpenAlex filter string.
         """
-        # Primary-field gate; always include a real polite-pool address.
+        # Primary-field, work-type, and venue-container gates.
         filters = [
             f"primary_topic.field.id:{_PRIMARY_FIELD_ID}",
             f"from_publication_date:{from_date}",
-            "type:article|preprint",
+            f"type:{_TYPES}",
+            f"primary_location.source.type:{_SOURCE_TYPES}",
         ]
         countries = os.environ.get(_COUNTRIES_ENV, "").strip()
         if countries:
             filters.insert(1, f"authorships.countries:{countries}")
-        filter_str = ",".join(filters)
 
+        # Supplementary opt-in pass: restrict to the constant venue allowlist so
+        # this query *adds* flagship-journal articles to the base results.
+        if venue_only:
+            filters.append(
+                "primary_location.source.id:" + "|".join(_VENUE_ALLOWLIST)
+            )
+
+        return ",".join(filters)
+
+    def _build_url(self, from_date: str, page: int, venue_only: bool = False) -> str:
+        """Build the full OpenAlex /works URL for a given page.
+
+        Args:
+            from_date: Lower bound date string 'YYYY-MM-DD'.
+            page: 1-based page number.
+            venue_only: Forwarded to _build_filter for the opt-in allowlist pass.
+
+        Returns:
+            Fully-qualified URL string.
+        """
         params: dict[str, str | int] = {
-            "filter": filter_str,
+            "filter": self._build_filter(from_date, venue_only=venue_only),
             "sort": "publication_date:desc",
             "per_page": _PER_PAGE,
             "page": page,
@@ -429,59 +492,80 @@ class OpenAlexSensor(BaseSensor):
         seen_source_ids: set[str] = set()
         skipped_noise = 0
 
-        for page in range(1, _MAX_PAGES + 1):
-            url = self._build_url(from_date, page)
-            try:
-                response = self.fetch_json(url, headers=headers)
-            except Exception as exc:
-                print(f"[openalex] page {page} fetch failed: {exc}", file=sys.stderr)
-                break
+        def _drain(venue_only: bool, label: str) -> None:
+            """Paginate one query into ``papers``, deduping on source_id.
 
-            results = response.get("results") or []
-            if not results:
-                break  # No more pages
+            Mutates the enclosing papers / seen_source_ids / skipped_noise via
+            nonlocal so the base and supplementary passes share one dedup set.
+            """
+            nonlocal skipped_noise
+            for page in range(1, _MAX_PAGES + 1):
+                url = self._build_url(from_date, page, venue_only=venue_only)
+                try:
+                    response = self.fetch_json(url, headers=headers)
+                except Exception as exc:
+                    print(f"[openalex] {label} page {page} fetch failed: {exc}", file=sys.stderr)
+                    break
 
-            for work in results:
-                parsed = _parse_work(work)
-                if not parsed:
-                    continue
-                if _is_repository_noise(parsed):
-                    skipped_noise += 1
-                    continue
+                results = response.get("results") or []
+                if not results:
+                    break  # No more pages
 
-                source_id = parsed.get("source_id", "")
-                if not source_id or source_id in seen_source_ids:
-                    continue
-                seen_source_ids.add(source_id)
+                for work in results:
+                    parsed = _parse_work(work)
+                    if not parsed:
+                        continue
+                    if _is_repository_noise(parsed):
+                        skipped_noise += 1
+                        continue
 
-                # Stash author details for post-ingest DB linking then remove
-                # the private key before returning the standard dict.
-                author_details: list[dict] = parsed.pop("_author_details", [])
+                    source_id = parsed.get("source_id", "")
+                    if not source_id or source_id in seen_source_ids:
+                        continue
+                    seen_source_ids.add(source_id)
 
-                # Generate canonical_id so dedup can work cross-source
-                parsed["canonical_id"] = canonical_paper_id(
-                    parsed["title"],
-                    parsed.get("authors") or [],
+                    # Stash author details for post-ingest DB linking then remove
+                    # the private key before returning the standard dict.
+                    author_details: list[dict] = parsed.pop("_author_details", [])
+
+                    # Generate canonical_id so dedup can work cross-source
+                    parsed["canonical_id"] = canonical_paper_id(
+                        parsed["title"],
+                        parsed.get("authors") or [],
+                    )
+                    parsed["title_normalized"] = parsed["canonical_id"]  # reuse hash key
+
+                    # Attach author details so run() can link them after ingest.
+                    # We smuggle them through a private key; run() will strip it.
+                    # (BaseSensor.run() only pops source_id, source_url, raw_metadata.)
+                    parsed["_author_details"] = author_details
+
+                    papers.append(parsed)
+
+                meta = response.get("meta") or {}
+                total_count = meta.get("count", 0)
+                fetched_so_far = page * _PER_PAGE
+                print(
+                    f"[openalex] {label} page {page}: got {len(results)} results "
+                    f"(total available: {total_count})",
+                    file=sys.stderr,
                 )
-                parsed["title_normalized"] = parsed["canonical_id"]  # reuse hash key
+                if fetched_so_far >= total_count:
+                    break
 
-                # Attach author details so run() can link them after ingest.
-                # We smuggle them through a private key; run() will strip it.
-                # (BaseSensor.run() only pops source_id, source_url, raw_metadata.)
-                parsed["_author_details"] = author_details
+        # Base pass: the broad, primary-field-gated economics feed.
+        _drain(venue_only=False, label="base")
 
-                papers.append(parsed)
-
-            meta = response.get("meta") or {}
-            total_count = meta.get("count", 0)
-            fetched_so_far = page * _PER_PAGE
+        # Supplementary pass: ADD flagship-journal articles, opt-in and off by
+        # default. The pass shares the dedup set, so venues already returned by
+        # the base pass are not double-counted.
+        if os.environ.get(_VENUE_ALLOWLIST_ENV, "").strip():
             print(
-                f"[openalex] page {page}: got {len(results)} results "
-                f"(total available: {total_count})",
+                f"[openalex] venue allowlist pass enabled "
+                f"({len(_VENUE_ALLOWLIST)} venues)",
                 file=sys.stderr,
             )
-            if fetched_so_far >= total_count:
-                break
+            _drain(venue_only=True, label="allowlist")
 
         # Update watch state with current fetch timestamp
         state = _load_state()

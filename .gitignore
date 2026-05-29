@@ -16,6 +16,10 @@ __pycache__/
 data/*.bak*
 data/feedback.jsonl
 
+# Generated model / cache artifacts (learned ranker, LLM rationale cache)
+data/learned_ranker.pkl
+data/rationale_cache.json
+
 # Python packaging
 *.egg-info/
 build/

@@ -25,6 +25,9 @@ export interface Deadline {
   url: string | null;
   description: string;
   urgency: 'final' | 'urgent' | 'soon' | 'upcoming' | 'rolling';
+  amount?: string | null;
+  eligibility?: string | null;
+  relevance?: number;
 }
 
 export interface SocialItem {
@@ -65,6 +68,9 @@ export interface PaperFeedback {
   starred: boolean;
   vote: 'up' | 'down' | null;
   hidden: boolean;
+  // ISO-8601 second-precision UTC stamp of the most recent vote; used to
+  // dedup feedback on import into data/feedback.jsonl. Undefined until voted.
+  votedAt?: string;
 }
 
 export type FeedbackStore = Record<string, PaperFeedback>;

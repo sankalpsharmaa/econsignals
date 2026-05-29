@@ -37,6 +37,8 @@ from econsignals.lib.db import (
     update_paper_relevance,
     init_db,
 )
+from econsignals.lib.novelty import collapse_duplicates
+from econsignals.lib.relevance import combine_percentile_ranks
 from econsignals.lib.zotero_embeddings import compute_zotero_embedding_scores
 from econsignals.lib.zotero_profile import (
     load_zotero_profile,
@@ -206,6 +208,40 @@ def _gather_deadlines(days: int = 60) -> list[dict]:
     return result
 
 
+def _dedupe_for_newsletter(papers: list[dict]) -> list[dict]:
+    """Collapse same-work duplicates, returning the surviving ORIGINAL dicts.
+
+    novelty.collapse_duplicates expects the snapshot dict shape (single `source`
+    string, author names as a list of strings). Newsletter dicts instead carry
+    `_source` and `authors` as a list of {name: ...} rows, so this builds a
+    minimal novelty-shaped view per paper (stashing its original index), collapses
+    the views, then returns each cluster's canonical ORIGINAL dict in input order.
+    Input order — already the percentile ranking — is preserved.
+    """
+    if not papers:
+        return []
+
+    views = []
+    for i, p in enumerate(papers):
+        author_names = [
+            (r.get("name") or "").strip()
+            for r in (p.get("authors") or [])
+            if isinstance(r, dict) and (r.get("name") or "").strip()
+        ]
+        views.append({
+            "title": p.get("title") or "",
+            "doi": p.get("doi"),
+            "abstract": p.get("abstract") or "",
+            "published_at": p.get("published_at"),
+            "source": p.get("_source"),
+            "authors": author_names,
+            "_orig_idx": i,
+        })
+
+    survivors = collapse_duplicates(views)
+    return [papers[v["_orig_idx"]] for v in survivors]
+
+
 def _gather_papers(
     days: int = 1,
     limit: int = 8,
@@ -228,20 +264,17 @@ def _gather_papers(
             p["_source"] = src
             curated.append(p)
 
-        # Embedding-based Zotero boost (zotero-arxiv-daily style) when corpus available
+        # Zotero affinity boost per paper (also consumed by the downstream EMA
+        # updater via `_zotero_boost`). Embedding path when a corpus exists, else
+        # the lexical author+content fallback.
         if corpus and len(corpus) > 0:
             emb_scores = compute_zotero_embedding_scores(curated, corpus)
             for p, score in zip(curated, emb_scores):
-                base = float(p.get("relevance_score") or 0)
-                source_boost = 0.15 if p.get("_source") in _TRUSTED_SOURCES else 0
                 zotero_boost = min(score / 10.0, 0.7)  # scale to ~0–0.7
-                p["_rank"] = base + source_boost + zotero_boost
                 p["_zotero_boost"] = zotero_boost
         else:
             # Fallback: lexical author + content overlap
             for p in curated:
-                base = float(p.get("relevance_score") or 0)
-                source_boost = 0.15 if p.get("_source") in _TRUSTED_SOURCES else 0
                 zotero_boost = 0.0
                 if profile and profile.get("ok"):
                     title = str(p.get("title") or "")
@@ -254,10 +287,28 @@ def _gather_papers(
                     a_score, _ = zotero_author_score(author_names, profile)
                     c_score, _ = zotero_content_score(title, abstract, profile)
                     zotero_boost = 0.4 * a_score + 0.3 * c_score
-                p["_rank"] = base + source_boost + zotero_boost
                 p["_zotero_boost"] = zotero_boost
 
+        # Rank by combining relevance, source prestige, and the Zotero boost in
+        # per-batch PERCENTILE space (matching the dashboard), so no single
+        # channel's raw scale dominates the daily cohort.
+        relevance = [float(p.get("relevance_score") or 0) for p in curated]
+        prestige = [0.15 if p.get("_source") in _TRUSTED_SOURCES else 0.0 for p in curated]
+        zotero = [float(p.get("_zotero_boost") or 0) for p in curated]
+        combined = combine_percentile_ranks(
+            {"relevance": relevance, "prestige": prestige, "zotero": zotero}
+        )
+        for p, c in zip(curated, combined or relevance):
+            p["_rank"] = c
+
+        # Stable sort preserves input (relevance) order on percentile ties.
         curated.sort(key=lambda p: p["_rank"], reverse=True)
+
+        # Collapse preprint/published and cross-source duplicates before the cut
+        # so the newsletter never lists the same work twice. Match on a
+        # novelty-shaped view (single `source`, author names as strings), then
+        # return the surviving ORIGINAL dicts in survivor order.
+        curated = _dedupe_for_newsletter(curated)
         return curated[:limit]
     finally:
         db.close()

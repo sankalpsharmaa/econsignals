@@ -57,13 +57,13 @@ A React + Vite single-page app in [`webapp/`](webapp/). It reads a static snapsh
 | Production build | `cd webapp && npm run build` → `webapp/dist/` |
 | Live backend (optional) | `econsignals-web` |
 
-**Deploy:** this code repo stays **private**; the built dashboard is published to a separate **public** repo (`sankalpsharmaa.github.io`) that serves it at the Pages URL. One command does it:
+**Deploy:** this code repo stays **private**; GitHub Pro serves the built dashboard from this repo's own `gh-pages` branch at the Pages URL (no public mirror repo). One command does it:
 
 ```bash
 bash scripts/deploy_site.sh
 ```
 
-It rebuilds the snapshot + app and pushes the static output to `sankalpsharmaa.github.io/econsignals/` (creating the public repo and enabling Pages on first run). Re-run it whenever you want to refresh the live data.
+It rebuilds the snapshot + app and force-pushes the static output to `gh-pages`, which GitHub Pages serves at `sankalpsharmaa.github.io/econsignals/`. Re-run it whenever you want to refresh the live data.
 
 ---
 

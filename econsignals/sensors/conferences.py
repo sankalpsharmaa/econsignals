@@ -6,6 +6,17 @@ For each conference the sensor attempts HTML scraping of the conference
 website to extract CFP text, deadline dates, and event dates. When the
 site offers no parseable dates the sensor falls back to generating a
 plausible deadline from the conference's typical submission month.
+
+Structured-source note (verified 2026-05-28): no maintained, structured,
+current econ-conference deadline feed could be verified. github.com/
+matteocourthoud has no econ-conference list repo; the only conference table in
+his repos (awesome-causal-inference/src/conferences.md) is causal-inference
+focused, last updated 2024-12, and its dates are mostly year-less ("9-11 Apr",
+"15 Jan") so they cannot be parsed into ISO deadlines. Ingesting it would
+violate the "real DATED records only" requirement. The AEA RFE conference
+listing serves only empty HTML to non-browser clients. The curated CONFERENCES
+registry below therefore remains the conference source; revisit if a
+structured feed appears.
 """
 
 from __future__ import annotations

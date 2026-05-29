@@ -29,6 +29,10 @@ def test_funding_run_marks_partial_success_on_fetch_failure(monkeypatch):
         return b"<html><p>Applications due January 15, 2030</p></html>"
 
     monkeypatch.setattr(funding.FundingSensor, "fetch_url", fake_fetch)
+    # Isolate the HTML-scrape path under test: the structured Grants.gov source
+    # makes its own live POST (covered by test_deadline_sources.py), so stub it
+    # out here to keep this regression test hermetic.
+    monkeypatch.setattr(funding.FundingSensor, "_scrape_grants_gov", lambda self: [])
 
     result = funding.FundingSensor().run()
 
@@ -74,7 +78,7 @@ def test_conferences_skip_fallback_when_base_fetch_fails(monkeypatch):
 
 
 def test_deadline_registries_use_updated_urls():
-    assert funding.FUNDING_SOURCES["russell_sage"]["url"] == "https://www.russellsage.org/apply"
+    assert funding.FUNDING_SOURCES["russell_sage"]["url"] == "https://www.russellsage.org/apply/application-deadlines"
     assert conferences.CONFERENCES["pacdev"]["url"] == "https://pacdev.ucdavis.edu/"
     assert conferences.CONFERENCES["bread"]["url"] == "https://www.ibread.org/conferences"
     assert "isa_south_asia" not in conferences.CONFERENCES

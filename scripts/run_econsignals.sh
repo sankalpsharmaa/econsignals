@@ -38,6 +38,11 @@ run_sensor crossref &
 run_sensor iza &
 run_sensor bread &
 run_sensor imf &
+run_sensor nep &
+run_sensor nber &
+run_sensor arxiv_econ &
+run_sensor worldbank &
+run_sensor semantic_scholar &
 run_sensor funding &
 run_sensor conferences &
 run_sensor mastodon &

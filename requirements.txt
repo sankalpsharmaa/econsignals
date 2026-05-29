@@ -8,3 +8,10 @@ numpy>=1.24.0
 
 # Testing
 pytest>=7.0.0
+
+# Optional extras (lazily imported; the install stays free/local without them)
+# - scikit-learn: logistic learned-ranker (falls back to a numpy classifier)
+# - transformers, adapters, torch: SPECTER2 embedding backend
+#     (enable with ECONSIGNALS_EMBED_BACKEND=specter2)
+# - LLM "why it matters": no extra package (stdlib urllib); enable with
+#     ECONSIGNALS_RATIONALE=1 + ANTHROPIC_API_KEY

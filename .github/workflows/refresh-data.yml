@@ -1,0 +1,80 @@
+name: Refresh data
+
+# Daily, pull fresh data through every sensor, rescore, and redeploy the
+# dashboard to gh-pages. The 17 MB SQLite corpus is not in git; it lives as a
+# release asset (tag: data-snapshot) that this job restores at the start and
+# re-uploads at the end, so the corpus grows across runs without bloating
+# history. Code stays private; GitHub Pro serves Pages from the private repo.
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # 11:00 UTC daily (~03:00-04:00 US Pacific)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # push gh-pages + manage the data-snapshot release asset
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_PAGES_TOKEN: ${{ github.token }} # consumed by scripts/deploy_site.sh
+      ECONSIGNALS_DB: ${{ github.workspace }}/data/econsignals.db
+      ECONSIGNALS_NO_ZOTERO: "1" # no local Zotero on the runner
+      OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+      EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+      BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+      BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          ( cd webapp && npm ci )
+
+      - name: Restore corpus from the data-snapshot release asset
+        run: |
+          mkdir -p data watches/papers
+          if gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
+               --pattern econsignals.db --dir data --clobber 2>/dev/null; then
+            echo "restored DB: $(du -h data/econsignals.db | cut -f1)"
+          else
+            echo "no prior DB asset — starting from an empty corpus"
+          fi
+          gh release download data-snapshot --repo "$GITHUB_REPOSITORY" \
+            --pattern state.json --dir watches/papers --clobber 2>/dev/null \
+            || echo "no prior sensor state — sensors will rebuild it"
+
+      - name: Scan sensors + rescore
+        run: bash scripts/refresh_data.sh
+
+      - name: Rebuild snapshot + deploy to gh-pages
+        run: bash scripts/deploy_site.sh
+
+      - name: Persist the updated corpus back to the release asset
+        if: always()
+        run: |
+          gh release view data-snapshot --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create data-snapshot --repo "$GITHUB_REPOSITORY" \
+                 --prerelease --title "Rolling data snapshot" \
+                 --notes "CI corpus state (SQLite DB + sensor state). Auto-updated by refresh-data.yml; not a software release."
+          gh release upload data-snapshot --repo "$GITHUB_REPOSITORY" \
+            data/econsignals.db watches/papers/state.json --clobber

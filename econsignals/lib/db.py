@@ -35,7 +35,7 @@ DB_PATH: Path = Path(
 )
 
 # Bump when a new _migrate step is added.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS deadlines (
     url TEXT,
     description TEXT,
     relevance_score REAL DEFAULT 0,
+    amount TEXT DEFAULT '',
+    eligibility TEXT DEFAULT '',
     notified_days TEXT,
     UNIQUE(name, deadline_date)
 );
@@ -236,6 +238,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < 1:
         _migrate_v1_collapse_duplicates(conn)
+    if version < 2:
+        _migrate_v2_deadline_fields(conn)
+    if version < _SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
 
@@ -328,6 +333,20 @@ def _migrate_v1_collapse_duplicates(conn: sqlite3.Connection) -> None:
             )
     conn.execute("UPDATE deadlines SET deadline_date = '' WHERE deadline_date IS NULL")
 
+    conn.commit()
+
+
+def _migrate_v2_deadline_fields(conn: sqlite3.Connection) -> None:
+    """Add amount + eligibility columns to deadlines (idempotent).
+
+    Existing DBs predate these columns; fresh DBs already carry them from the
+    DDL, so each ALTER is guarded by a column-existence check.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(deadlines)").fetchall()}
+    if "amount" not in cols:
+        conn.execute("ALTER TABLE deadlines ADD COLUMN amount TEXT DEFAULT ''")
+    if "eligibility" not in cols:
+        conn.execute("ALTER TABLE deadlines ADD COLUMN eligibility TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -664,8 +683,8 @@ def upsert_deadline(deadline: dict) -> int:
             """
             INSERT INTO deadlines
                 (type, name, organization, deadline_date, event_date,
-                 url, description, relevance_score, notified_days)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 url, description, relevance_score, amount, eligibility, notified_days)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name, deadline_date) DO UPDATE SET
                 type            = excluded.type,
                 organization    = COALESCE(excluded.organization, organization),
@@ -673,6 +692,8 @@ def upsert_deadline(deadline: dict) -> int:
                 url             = COALESCE(excluded.url, url),
                 description     = COALESCE(excluded.description, description),
                 relevance_score = excluded.relevance_score,
+                amount          = COALESCE(excluded.amount, amount),
+                eligibility     = COALESCE(excluded.eligibility, eligibility),
                 notified_days   = COALESCE(excluded.notified_days, notified_days)
             """,
             (
@@ -684,6 +705,8 @@ def upsert_deadline(deadline: dict) -> int:
                 deadline.get("url"),
                 deadline.get("description"),
                 deadline.get("relevance_score", 0),
+                deadline.get("amount"),
+                deadline.get("eligibility"),
                 notified,
             ),
         )

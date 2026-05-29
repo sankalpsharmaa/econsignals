@@ -29,9 +29,12 @@ from econsignals.lib.db import (
     get_top_papers,
     get_upcoming_deadlines,
 )
+from econsignals.lib.novelty import collapse_duplicates, suppress_seen
+from econsignals.lib.rationale import rationale_batch
 from econsignals.lib.relevance import (
     _CORE_TOPICS,
     _INDIA_PATTERNS,
+    combine_percentile_ranks,
     load_interest_keywords,
 )
 from econsignals.lib.zotero_embeddings import compute_zotero_embedding_scores
@@ -49,6 +52,7 @@ DEFAULT_OUTPUT: Path = PROJ_ROOT / "webapp" / "public" / "feed.json"
 
 _SENSORS = [
     "openalex", "crossref", "iza", "bread", "imf",
+    "repec_nep", "nber", "arxiv", "worldbank", "semantic_scholar",
     "mastodon", "bluesky", "twitter_bridge", "funding", "conferences",
 ]
 
@@ -74,16 +78,21 @@ _MAX_PAPERS = 250
 _MAX_SOCIAL = 60
 _ABSTRACT_CHARS = 320
 
-# Zotero re-ranking: similarity to the user's own library is the strongest taste
-# signal, so the feed is ranked by a blend of it and the base relevance (quality)
-# score. _CANDIDATE_POOL papers are embedded; the top _MAX_PAPERS are kept.
+# Feed re-ranking: relevance, Zotero-library similarity, and the learned ranker
+# are combined in per-batch percentile space (see _personalize). _CANDIDATE_POOL
+# papers are scored; novelty then collapses/suppresses before the top _MAX_PAPERS
+# are kept.
 _CANDIDATE_POOL = 600
-_ZOTERO_WEIGHT = 0.45
 # Zotero top-k similarity saturates near 7.0 for anything econ-ish and drops to
 # ~2.5 for off-topic work, so normalize on a FIXED scale (min-max would collapse
 # the homogeneous top). This demotes the off-topic tail while letting venue
 # prestige (in relevance_score) rank the on-topic frontier.
 _ZSIM_LO, _ZSIM_HI = 3.0, 7.0
+
+# Number of top feed items to summarise with a "why it matters" rationale. The
+# call is a no-op (returns None) unless an LLM backend is configured, so this
+# only bounds spend when one IS configured.
+_RATIONALE_TOP_N = 25
 
 
 def _is_caption(text: str | None) -> bool:
@@ -175,44 +184,191 @@ def _urgency(days: int | None) -> str:
     return "upcoming"
 
 
-def _personalize(papers: list[dict]) -> tuple[list[dict], bool]:
-    """Re-rank candidates by similarity to the user's Zotero library.
+def _specter2_zotero_scores(cands: list[dict], corpus: list[dict]) -> list[float] | None:
+    """Score candidates by SPECTER2 top-k similarity to the Zotero corpus.
 
-    Library similarity is the strongest signal of what the user actually reads,
-    so the feed is sorted by a blend of normalized Zotero similarity and the base
-    relevance (quality) score. Each paper gets `_zotero` (0-1) and `_final` (the
-    blend). Falls back to relevance order, returning personalized=False, when
-    Ollama or the Zotero corpus is unavailable or scoring fails.
+    Consulted only when ECONSIGNALS_EMBED_BACKEND=specter2 (and the heavy deps
+    import); otherwise returns None so the caller uses the default Ollama path.
+    Mirrors compute_zotero_embedding_scores' top-k pooling and floor rescaling by
+    reusing that module's tuned constants, so the returned scores sit on the same
+    0–_MAX_BOOST*scale band the Ollama path produces.
+
+    Returns:
+        Pre-scaled scores aligned to `cands`, or None when the backend is off or
+        any embedding step fails.
     """
-    for p in papers:
-        p["_zotero"] = None
-        p["_final"] = p.get("relevance_score") or 0.0
+    from econsignals.lib import specter2_embeddings as s2
 
+    if not s2.backend_enabled():
+        return None
+
+    from econsignals.lib.zotero_embeddings import (
+        _MAX_BOOST,
+        _SIM_FLOOR,
+        _SIM_WIDTH,
+        _TOP_K,
+        _cosine_similarity,
+    )
+
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    cand_texts = [f"{c.get('title') or ''} {c.get('abstract') or ''}".strip() or "(no text)" for c in cands]
+    corpus_texts = [str(c.get("text") or "").strip() for c in corpus]
+    corpus_texts = [t for t in corpus_texts if t]
+    if not corpus_texts:
+        return None
+
+    enc_corpus = s2.embed_texts(corpus_texts)
+    enc_cands = s2.embed_texts(cand_texts)
+    if not enc_corpus or not enc_cands:
+        return None
+
+    sim = _cosine_similarity(enc_cands, enc_corpus)
+    k = min(_TOP_K, sim.shape[1])
+    topk = np.sort(sim, axis=1)[:, -k:]
+    pooled = topk.mean(axis=1)
+    rel = np.clip((pooled - _SIM_FLOOR) / _SIM_WIDTH, 0.0, _MAX_BOOST)
+    # Scale 10x to match compute_zotero_embedding_scores' default `scale`.
+    return [float(s) for s in rel * 10.0]
+
+
+def _zotero_norm_scores(papers: list[dict]) -> list[float] | None:
+    """Return normalized [0,1] Zotero-similarity scores aligned to `papers`, or None.
+
+    Embeds candidates against the user's Zotero library and rescales onto the
+    fixed _ZSIM_LO.._ZSIM_HI band. Uses the SPECTER2 backend when selected, else
+    the default Ollama path (compute_zotero_embedding_scores). Returns None when
+    personalization is disabled, the corpus is empty, or scoring fails — the
+    caller then ranks on relevance alone.
+    """
     if os.environ.get("ECONSIGNALS_NO_ZOTERO"):
-        return papers, False
+        return None
     try:
         corpus = load_zotero_corpus()
         if not corpus:
-            return papers, False
+            return None
         cands = [
             {"title": p.get("title") or "", "abstract": p.get("abstract") or ""}
             for p in papers
         ]
-        scores = compute_zotero_embedding_scores(cands, corpus)
+        scores = _specter2_zotero_scores(cands, corpus)
+        if scores is None:
+            scores = compute_zotero_embedding_scores(cands, corpus)
     except Exception as exc:  # Ollama down, model missing, corpus unreadable
         print(f"[snapshot] Zotero personalization skipped: {exc}", file=sys.stderr)
-        return papers, False
+        return None
 
     if not scores or len(scores) != len(papers) or max(scores) <= 0:
-        return papers, False
+        return None
 
     span = _ZSIM_HI - _ZSIM_LO
-    for p, s in zip(papers, scores):
-        z = max(0.0, min(1.0, (s - _ZSIM_LO) / span))
+    return [max(0.0, min(1.0, (s - _ZSIM_LO) / span)) for s in scores]
+
+
+def _personalize(papers: list[dict]) -> tuple[list[dict], bool]:
+    """Re-rank candidates by combining the available signals in percentile space.
+
+    Three channels rank the feed: the base relevance (quality) score, Zotero
+    library similarity (the strongest taste signal), and — when a model exists —
+    the learned personal ranker. They are combined in per-batch PERCENTILE space
+    with equal weight (relevance.combine_percentile_ranks), so no channel's raw
+    scale dominates and daily cohorts stay comparable. Each paper gets `_zotero`
+    (0-1 raw similarity, or None) and `_final` (the combined percentile).
+
+    When every optional backend is off (the default), only the relevance channel
+    is present; its percentile rank is a monotone transform of relevance_score,
+    so the stable sort reproduces the get_top_papers order exactly. Returns
+    personalized=True only when the Zotero channel contributed.
+    """
+    n = len(papers)
+    relevance = [float(p.get("relevance_score") or 0.0) for p in papers]
+
+    zotero = _zotero_norm_scores(papers) if papers else None
+    for p, z in zip(papers, zotero or [None] * n):
         p["_zotero"] = z
-        p["_final"] = _ZOTERO_WEIGHT * z + (1 - _ZOTERO_WEIGHT) * (p.get("relevance_score") or 0.0)
+
+    # Learned ranker is the supervised channel: it contributes ONLY when a model
+    # has already been trained and persisted. train_if_missing=False keeps the
+    # default feed build side-effect-free (no implicit training, no pkl write, no
+    # extra Ollama pass); training is an explicit opt-in the integrator wires.
+    try:
+        from econsignals.lib.learned_ranker import rank_papers
+
+        learned = rank_papers(papers, train_if_missing=False) if papers else None
+    except Exception as exc:  # numpy/Ollama/model issues degrade to no channel
+        print(f"[snapshot] learned ranker skipped: {exc}", file=sys.stderr)
+        learned = None
+    if learned is not None and len(learned) != n:
+        learned = None
+
+    combined = combine_percentile_ranks(
+        {"relevance": relevance, "zotero": zotero, "learned": learned}
+    )
+    for p, c in zip(papers, combined or relevance):
+        p["_final"] = c
+
+    # Stable sort preserves the relevance-only (default) order, since equal
+    # percentiles keep their input positions.
     papers.sort(key=lambda p: p["_final"], reverse=True)
-    return papers, True
+    return papers, zotero is not None
+
+
+def _zotero_seen_titles() -> set[str]:
+    """Return normalized titles of the user's Zotero library, for suppression.
+
+    A paper already in the library is something the user has seen, so it is
+    dropped from the feed. The Zotero corpus carries no DOI, so suppression keys
+    on normalized titles only. Returns an empty set when the library is
+    unavailable, which makes suppress_seen a no-op (preserving default behavior).
+    """
+    from econsignals.lib.normalize import normalize_title
+
+    try:
+        corpus = load_zotero_corpus()
+    except Exception as exc:  # Zotero DB locked/absent/unreadable
+        print(f"[snapshot] Zotero seen-titles skipped: {exc}", file=sys.stderr)
+        return set()
+    keys = {normalize_title(c.get("title") or "") for c in corpus}
+    return {k for k in keys if k}
+
+
+def _apply_novelty_and_rationale(
+    built: list[dict],
+    seen_keys: set[str],
+) -> list[dict]:
+    """Collapse duplicates, suppress already-seen work, truncate, add rationale.
+
+    Operates on the built display dicts (authors as list[str], single `source`),
+    the shape novelty.py expects. Steps, in order:
+
+    1. collapse_duplicates  — merge preprint/published and cross-source copies,
+       attaching `also_in` (the other sources the work appeared in).
+    2. suppress_seen        — drop papers whose normalized title is in seen_keys
+       (the Zotero library). Empty seen_keys is a no-op.
+    3. truncate to _MAX_PAPERS.
+    4. attach `why_it_matters` to the kept items — None by default (no LLM
+       backend), so the dashboard schema is stable either way.
+
+    Pure with respect to the DB; the only side effect is rationale_batch's
+    optional network call, which is skipped when no API key is set.
+    """
+    collapsed = collapse_duplicates(built)
+    kept = suppress_seen(collapsed, seen_keys)[:_MAX_PAPERS]
+
+    # why_it_matters: present on every item (None when the backend is off).
+    for paper in kept:
+        paper["why_it_matters"] = None
+    top = kept[:_RATIONALE_TOP_N]
+    rationales = rationale_batch(top)
+    if rationales:
+        from econsignals.lib.rationale import _paper_key
+
+        for paper in top:
+            paper["why_it_matters"] = rationales.get(_paper_key(paper))
+    return kept
 
 
 def build_snapshot() -> dict:
@@ -220,11 +376,16 @@ def build_snapshot() -> dict:
     interest_kw = load_interest_keywords()
     now = datetime.now(timezone.utc)
 
-    # Papers: take a quality-ranked candidate pool, then re-rank by similarity to
-    # the user's Zotero library (their actual taste), then denoise.
+    # Papers: take a quality-ranked candidate pool, then re-rank by combining
+    # relevance, Zotero similarity, and the learned ranker in percentile space.
     papers_raw = get_top_papers(limit=_CANDIDATE_POOL, min_score=0.0)
     papers_raw, personalized = _personalize(papers_raw)
-    papers = []
+
+    # Build display dicts for the WHOLE ranked pool (caption-filtered only).
+    # Novelty runs on these built dicts before truncation, so collapsing
+    # duplicates and suppressing already-seen work does not shrink the feed
+    # below _MAX_PAPERS.
+    built = []
     for p in papers_raw:
         # Source titles/abstracts often carry HTML entities ("&amp;", "&lt;");
         # decode them so the dashboard shows real characters.
@@ -238,7 +399,7 @@ def build_snapshot() -> dict:
         abstract_short = abstract[:_ABSTRACT_CHARS].rstrip()
         if abstract and len(abstract) > _ABSTRACT_CHARS:
             abstract_short += "…"
-        papers.append({
+        built.append({
             "id": p["id"],
             "title": title,
             "authors": [unescape(a["name"]) for a in p.get("authors", [])][:8],
@@ -254,11 +415,12 @@ def build_snapshot() -> dict:
             "topics": topics,
             "india": is_india,
         })
-        if len(papers) >= _MAX_PAPERS:
-            break
 
-    # Deadlines: dated within 120 days + curated rolling, denoised
-    deadlines_raw = get_upcoming_deadlines(days=120, include_rolling=True)
+    papers = _apply_novelty_and_rationale(built, _zotero_seen_titles())
+
+    # Deadlines: dated within 270 days (grant cycles are planned months ahead)
+    # + curated rolling, denoised.
+    deadlines_raw = get_upcoming_deadlines(days=270, include_rolling=True)
     deadlines = []
     for d in deadlines_raw:
         if not _clean_deadline(d):
@@ -275,6 +437,9 @@ def build_snapshot() -> dict:
             "url": d.get("url"),
             "description": unescape((d.get("description") or "")[:240]),
             "urgency": _urgency(days),
+            "amount": (d.get("amount") or "").strip() or None,
+            "eligibility": (d.get("eligibility") or "").strip() or None,
+            "relevance": round(float(d.get("relevance_score") or 0), 3),
         })
 
     # Social: econ-only, denoised, most recent first
