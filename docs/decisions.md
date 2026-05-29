@@ -4,6 +4,19 @@ Append-only audit trail. Newest entries at top. See `~/claude-config/rules/decis
 
 ---
 
+## 2026-05-28 19:30, Decision 9, OpenAlex collects broadly; India is a ranking preference, not a collection filter
+
+Stage: code-choice
+Tried:
+  - Keep hard South-Asia country gate (Decision 8): tool can never surface a relevant non-India dev/urban paper
+  - Field-only gate + optional opt-in country env var (kept)
+Kept: primary_topic.field.id:fields/20 only; country gate added solely when ECONSIGNALS_OPENALEX_COUNTRIES is set. Discriminating test confirmed the field gate alone keeps out the crypto/coffee/CompSci noise (their primary field is not Economics), so the country gate was over-correction. India-first ordering comes from the relevance India floor, not from dropping non-India papers at collection.
+Dropped: collection-wide country gate (architecture error: conflated ranking preference with collection scope; the user asked to monitor econ broadly)
+Files: econsignals/sensors/openalex.py
+Assumptions: field gate is sufficient noise control; residual AI-spam papers sink via low relevance
+Verify: curl OpenAlex with primary_topic.field.id:fields/20 (no country) -> econ titles, no crypto/coffee/CS; top-20 stays India-dominated via ranking
+Status: accepted
+
 ## 2026-05-28 18:30, Decision 8, OpenAlex hard South-Asia country filter (precision over breadth)
 
 Stage: divergence
@@ -17,7 +30,7 @@ Assumptions (can be wrong):
   - OpenAlex should be the India/SA-precision source; crossref (journals) + iza/bread cover global breadth
   - User wants India-authored work surfaced; a brilliant non-SA urban paper from OpenAlex is now missed (mitigated: crossref/iza still global)
 Verify: OPENALEX_EMAIL=... python -m econsignals.sensors.openalex -> stderr "collected N papers"; top-20 now India-dominated
-Status: accepted (revisit if breadth matters more than precision)
+Status: reversed by Decision 9
 
 ## 2026-05-28 18:00, Decision 7, Dashboard denoise at presentation layer, not by deleting rows
 

@@ -38,9 +38,13 @@ _DEFAULT_LOOKBACK_DAYS = 7
 # CompSci papers that merely carry a 0.27-score "Economics" concept.
 _PRIMARY_FIELD_ID = "fields/20"
 
-# ISO-2 author countries to scope the feed for an India-focused, South-Asia /
-# developing-country profile. Widen or narrow this single string to retune geo.
-_AUTHOR_COUNTRIES = "IN|BD|PK|LK|NP"
+# Optional author-country scope (ISO-2, pipe-separated). UNSET by default: the
+# field gate alone removes the off-field noise, so we collect economics broadly
+# and let the relevance engine's India floor handle India-first *ranking* — a
+# collection-wide country gate would permanently hide relevant non-India dev/
+# urban work (a Kenya RCT, a US-cities JUE paper). Set
+# ECONSIGNALS_OPENALEX_COUNTRIES="IN|BD|PK|LK|NP" to restrict collection instead.
+_COUNTRIES_ENV = "ECONSIGNALS_OPENALEX_COUNTRIES"
 
 # Polite-pool contact email. OpenAlex routes a valid, monitored address to the
 # faster pool; a placeholder example.com does not reliably qualify.
@@ -360,9 +364,10 @@ class OpenAlexSensor(BaseSensor):
     def _build_url(self, from_date: str, page: int) -> str:
         """Build the full OpenAlex /works URL for a given page.
 
-        Gates on the work's primary field (Economics) and on South-Asian
-        author countries, so off-field papers carrying a low-score Economics
-        concept tag never enter the candidate set.
+        Gates on the work's primary field (Economics), which drops the
+        crypto/coffee/CompSci papers that merely carried a low-score Economics
+        concept tag. An optional author-country scope is added only when
+        ECONSIGNALS_OPENALEX_COUNTRIES is set (default: collect broadly).
 
         Args:
             from_date: Lower bound date string 'YYYY-MM-DD'.
@@ -371,13 +376,15 @@ class OpenAlexSensor(BaseSensor):
         Returns:
             Fully-qualified URL string.
         """
-        # Primary-field + geo gate; always include a real polite-pool address.
+        # Primary-field gate; always include a real polite-pool address.
         filters = [
             f"primary_topic.field.id:{_PRIMARY_FIELD_ID}",
-            f"authorships.countries:{_AUTHOR_COUNTRIES}",
             f"from_publication_date:{from_date}",
             "type:article|preprint",
         ]
+        countries = os.environ.get(_COUNTRIES_ENV, "").strip()
+        if countries:
+            filters.insert(1, f"authorships.countries:{countries}")
         filter_str = ",".join(filters)
 
         params: dict[str, str | int] = {
@@ -411,9 +418,10 @@ class OpenAlexSensor(BaseSensor):
         email = _resolve_email()
         headers = {"User-Agent": f"EconSignals/1.0 (mailto:{email})"}
 
+        scope = os.environ.get(_COUNTRIES_ENV, "").strip() or "global"
         print(
             f"[openalex] fetching works from {from_date} "
-            f"(field={_PRIMARY_FIELD_ID}, countries={_AUTHOR_COUNTRIES})",
+            f"(field={_PRIMARY_FIELD_ID}, countries={scope})",
             file=sys.stderr,
         )
 

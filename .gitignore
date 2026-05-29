@@ -25,3 +25,4 @@ dist/
 webapp/node_modules/
 webapp/dist/
 .ruff_cache/
+.playwright-mcp/
